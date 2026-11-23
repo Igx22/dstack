@@ -1,17 +1,20 @@
 """Fetch durable minute batches, commit usage rows, then ACK over SSH."""
 
 import asyncio
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager, nullcontext
 
 import httpx
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from dstack._internal.proxy.lib.schemas.usage import UsageBatch
 from dstack._internal.server.db import get_db, get_session_ctx
 from dstack._internal.server.models import GatewayModel, GatewayReplicaModel
 from dstack._internal.server.services.gateways.connection import GatewayConnection
-from dstack._internal.server.services.usage import ingest_usage_batch
+from dstack._internal.server.services.usage import UsageConflict, ingest_usage_batch
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -88,6 +91,7 @@ async def _collect_pages(
             page = await client.fetch_usage_batches(PAGE_SIZE)
         if not page.batches:
             return True
+        rejected: list[tuple[UsageBatch, str]] = []
         async with _ingestion_session() as session:
             # The lease or source may have changed while GET was in flight.
             current = await _get_source(
@@ -96,14 +100,41 @@ async def _collect_pages(
             if current != source:
                 return False
             for batch in page.batches:
-                await ingest_usage_batch(session, replica_id, gateway_id, batch)
-        # The whole page is committed before any ACK can reach the Gateway.
+                try:
+                    # A missing user on a later row must undo this batch's earlier rows.
+                    async with session.begin_nested():
+                        await ingest_usage_batch(session, replica_id, gateway_id, batch)
+                except UsageConflict as exc:
+                    if gateway_id is None:
+                        raise  # An unbound replica may only ACK an exact replay.
+                    rejected.append((batch, str(exc)))
+                except IntegrityError as exc:
+                    if not _is_foreign_key_violation(exc):
+                        raise
+                    # usage_batches has one foreign key: user_id references users.id.
+                    rejected.append((batch, "Referenced user does not exist"))
+        # The page has committed. Log every rejected payload before allowing its removal.
+        for batch, reason in rejected:
+            logger.error(
+                "Could not insert usage batch from Gateway %s replica %s: %s. Batch: %s",
+                gateway_id,
+                replica_id,
+                reason,
+                batch.model_dump_json(),
+            )
         ids = [batch.batch_id for batch in page.batches]
         async with connection.client() as client:
             await client.acknowledge_usage(ids)
         if not page.has_more:
             return True
     return False
+
+
+def _is_foreign_key_violation(exc: IntegrityError) -> bool:
+    return (
+        getattr(exc.orig, "sqlstate", None) == "23503"
+        or getattr(exc.orig, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+    )
 
 
 async def _get_source(

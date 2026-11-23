@@ -213,30 +213,85 @@ class TestCollectGatewayUsage:
         assert queue.items == []
         assert sorted(await session.scalars(select(UsageBatchModel.total_tokens))) == [23, 23, 27]
 
-    async def test_conflict_rolls_back_entire_page_without_ack(self, session, replica, batch):
+    @pytest.mark.parametrize("batch_id", ["batch-1", "other-id-for-same-minute"])
+    async def test_logs_conflict_and_accepts_other_batches(
+        self, session, replica, batch, batch_id, caplog, monkeypatch
+    ):
         await ingest_usage_batch(session, replica.id, replica.gateway_id, batch())
         await session.commit()
-        items = [batch("new", offset=1), batch(tokens=4)]
+        conflict = batch(batch_id, tokens=4)
+        items = [batch("before", offset=-1), conflict, batch("after", offset=1, tokens=7)]
         queue = GatewayQueue(replica.ip_address, items)
+        acknowledge = queue.acknowledge_usage
+        errors_at_ack = []
+
+        async def lose_ack(ids):
+            errors_at_ack.extend(
+                r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
+            )
+            raise httpx.WriteError("Lost ACK before delivery")
+
+        monkeypatch.setattr(queue, "acknowledge_usage", lose_ack)
         await usage.collect_gateway_usage(queue.connection, replica.id, replica.lock_token)
-        assert queue.fetches == 1
+        assert len(errors_at_ack) == 1
+        assert conflict.model_dump_json() in errors_at_ack[0]
+        assert str(replica.id) in errors_at_ack[0]
+        assert queue.items == items
+
+        await claim(session, replica)
+        monkeypatch.setattr(queue, "acknowledge_usage", acknowledge)
+        assert await usage.drain_gateway_usage(
+            queue.connection, replica.id, replica.gateway_id, replica.lock_token
+        )
+        assert queue.acks == [["before", batch_id, "after"]]
+        assert queue.items == []
+        rows = await session.execute(
+            select(UsageBatchModel.batch_id, UsageBatchModel.total_tokens).order_by(
+                UsageBatchModel.interval_start
+            )
+        )
+        assert rows.all() == [("before", 23), ("batch-1", 23), ("after", 27)]
+
+    async def test_failed_page_transaction_keeps_conflict_and_new_batch_pending(
+        self, session, replica, batch, monkeypatch
+    ):
+        await ingest_usage_batch(session, replica.id, replica.gateway_id, batch())
+        await session.commit()
+        items = [batch(tokens=4), batch("new", offset=1)]
+        queue = GatewayQueue(replica.ip_address, items)
+        ingestion_session = usage._ingestion_session
+
+        @asynccontextmanager
+        async def fail_before_commit():
+            async with ingestion_session() as page_session:
+                yield page_session
+                raise OperationalError("COMMIT", None, OSError("Database unavailable"))
+
+        monkeypatch.setattr(usage, "_ingestion_session", fail_before_commit)
+        await usage.collect_gateway_usage(queue.connection, replica.id, replica.lock_token)
         assert queue.acks == []
         assert queue.items == items
         assert (await session.scalars(select(UsageBatchModel.batch_id))).all() == ["batch-1"]
-        assert (await session.scalars(select(UsageBatchModel.total_tokens))).all() == [23]
 
-    async def test_invalid_last_row_rolls_back_page_without_ack(
-        self, session, replica, batch, usage_user
+    async def test_missing_user_rolls_back_only_its_batch_and_drain_finishes(
+        self, session, replica, batch, usage_user, caplog
     ):
         missing = uuid.UUID(int=2**128 - 1)
         assert usage_user.id < missing
-        last = batch("last", offset=1, entries=[entry(usage_user.id), entry(missing)])
-        items = [batch(), last]
+        rejected = batch("missing-user", offset=1, entries=[entry(usage_user.id), entry(missing)])
+        items = [batch(), rejected, batch("later", offset=2)]
         queue = GatewayQueue(replica.ip_address, items)
-        await usage.collect_gateway_usage(queue.connection, replica.id, replica.lock_token)
-        assert queue.fetches == 1
-        assert queue.acks == [] and queue.items == items
-        assert (await session.scalars(select(UsageBatchModel))).all() == []
+        assert await usage.drain_gateway_usage(
+            queue.connection, replica.id, replica.gateway_id, replica.lock_token
+        )
+        assert queue.acks == [["batch-1", "missing-user", "later"]]
+        assert queue.items == []
+        assert any(
+            r.levelno == logging.ERROR and rejected.model_dump_json() in r.getMessage()
+            for r in caplog.records
+        )
+        rows = await session.scalars(select(UsageBatchModel.batch_id))
+        assert sorted(rows) == ["batch-1", "later"]
 
     async def test_empty_page_caught_up_but_empty_batch_unacknowledged(self, replica, batch):
         queue = GatewayQueue(replica.ip_address, [])

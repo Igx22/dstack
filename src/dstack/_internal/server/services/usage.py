@@ -23,7 +23,7 @@ _MAX_COUNTER = 2**63 - 1
 
 
 class UsageConflict(ValueError):
-    """Identity or immutable content changed: preserve the source for reconciliation."""
+    """An incoming usage batch cannot be reconciled with its stored history."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,19 @@ async def ingest_usage_batch(
             )
         )
     ).all()
+    if not existing:
+        if gateway_id is None:
+            raise UsageConflict("Cannot insert a new batch without its Gateway")
+        occupying_batch_id = await session.scalar(
+            select(UsageBatchModel.batch_id).where(
+                UsageBatchModel.gateway_replica_id == gateway_replica_id,
+                UsageBatchModel.interval_start == batch.interval_start,
+                UsageBatchModel.batch_row_number == 0,
+            )
+        )
+        if occupying_batch_id is None:
+            raise RuntimeError("Usage insert conflicted without a matching batch or minute")
+        raise UsageConflict(f"Replica minute already belongs to batch {occupying_batch_id!r}")
     for row in existing:
         if gateway_id is not None and row.gateway_id != gateway_id:
             raise UsageConflict("Historical Gateway identity cannot change")
@@ -94,7 +107,7 @@ async def ingest_usage_batch(
         for row in existing
     }
     if stored_entries != entries:
-        raise UsageConflict("Missing source, conflicting content or duplicate minute")
+        raise UsageConflict("Stored user/run entries or counters differ")
     return ReceiptResult(batch.batch_id, inserted=False)
 
 
