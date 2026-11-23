@@ -243,6 +243,7 @@ async def test_stream_disconnect(harness, after_usage, progressive):
             headers={"Authorization": "Bearer token-a", "X-Test-Request-ID": "disconnect"},
         ) as response:
             response.raise_for_status()
+            event = None
             saw_content = False
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
@@ -253,6 +254,7 @@ async def test_stream_disconnect(harness, after_usage, progressive):
                     break
             assert saw_content  # Content arrives while final usage / DONE is still held.
             if progressive:
+                assert event is not None
                 assert event["usage"] is None
                 await close_minute(h)
                 assert (await h.batches())["batches"] == []

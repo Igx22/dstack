@@ -8,6 +8,7 @@ import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy_utils import UUIDType
 
 from dstack._internal.server.db import Database
@@ -56,13 +57,13 @@ def run_case(conn, populated):
                 assert isinstance(coltype, sa.CHAR) and coltype.length == 32
             else:
                 assert isinstance(coltype, sa.UUID)
-        assert all(
-            isinstance(batches.c[name].type, sa.DateTime) and not batches.c[name].type.timezone
-            for name in times
-        )
+        for name in times:
+            coltype = batches.c[name].type
+            assert isinstance(coltype, sa.DateTime) and not coltype.timezone
         assert all(isinstance(batches.c[name].type, sa.BigInteger) for name in counters)
         assert batches.c.batch_row_number.type.compile(dialect=conn.dialect) == "INTEGER"
-        assert batches.c.batch_id.type.length == 128
+        batch_id_type = batches.c.batch_id.type
+        assert isinstance(batch_id_type, sa.String) and batch_id_type.length == 128
         assert inspector.get_pk_constraint("usage_batches")["constrained_columns"] == ["id"]
         (fk,) = inspector.get_foreign_keys("usage_batches")
         assert fk["constrained_columns"] == ["user_id"]
@@ -147,12 +148,12 @@ def run_case(conn, populated):
         if conn.dialect.name == "sqlite":
             invalid += [dict(batch_row_number=1.5), dict(unknown_usage_attempts=1.5)]
         for changes in invalid:
-            with pytest.raises(sa.exc.IntegrityError), conn.begin_nested():
+            with pytest.raises(IntegrityError), conn.begin_nested():
                 add_row(**changes)
 
         for table in parents[1:]:
             conn.execute(table.delete())
-        with pytest.raises(sa.exc.IntegrityError), conn.begin_nested():
+        with pytest.raises(IntegrityError), conn.begin_nested():
             conn.execute(parents[0].delete())
         with pytest.raises(ValueError, match="backup"):
             migration.downgrade()
