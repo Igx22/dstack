@@ -661,6 +661,7 @@ async def _process_running_item(item: GatewayReplicaPipelineItem):
     gateway_model = _get_loaded_gateway_model(replica_model)
     try:
         connection = await gateway_connections_pool.get_or_add(
+            replica_id=replica_model.id,
             hostname=get_or_error(replica_model.ip_address),
             id_rsa=replica_model.ssh_private_key,
         )
@@ -1546,7 +1547,6 @@ async def _process_terminating_item(item: GatewayReplicaPipelineItem):
         replica_fields=_REPLICA_FIELDS_MIN
         + [
             GatewayReplicaModel.instance_id,
-            GatewayReplicaModel.ip_address,
             GatewayReplicaModel.backend_id,
             GatewayReplicaModel.configuration,
             GatewayReplicaModel.backend_data,
@@ -1615,8 +1615,7 @@ async def _process_terminating_item(item: GatewayReplicaPipelineItem):
             await _commit_update(item, replica_model, update_map={})
             return
 
-    if replica_model.ip_address is not None:
-        await gateway_connections_pool.remove(replica_model.ip_address)
+    await gateway_connections_pool.remove(replica_model.id)
 
     await _commit_update(item, replica_model, mark_terminated_update_map)
 

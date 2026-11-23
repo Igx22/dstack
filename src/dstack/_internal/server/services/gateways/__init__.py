@@ -347,7 +347,7 @@ async def connect_to_gateway_replica_with_retry(
     for attempt in range(GATEWAY_CONNECT_ATTEMPTS):
         try:
             connection = await gateway_connections_pool.get_or_add(
-                gateway_replica.ip_address, gateway_replica.ssh_private_key
+                gateway_replica.id, gateway_replica.ip_address, gateway_replica.ssh_private_key
             )
             break
         except SSHError as e:
@@ -693,6 +693,7 @@ async def get_or_add_gateway_connections(
             raise GatewayError("Failed to connect to gateway replica")
         try:
             conn = await gateway_connections_pool.get_or_add(
+                replica_id=replica.id,
                 hostname=replica.ip_address,
                 id_rsa=replica.ssh_private_key,
             )
@@ -767,7 +768,7 @@ async def init_gateways(session: AsyncSession):
         for gateway_replica, error in await gather_map_async(
             [r for r in gateway_replicas if r.ip_address],
             lambda r: gateway_connections_pool.get_or_add(
-                get_or_error(r.ip_address), r.ssh_private_key, True
+                r.id, get_or_error(r.ip_address), r.ssh_private_key, close_existing_tunnel=True
             ),
             return_exceptions=True,
         ):
@@ -828,6 +829,7 @@ async def _update_gateway_replica(
         )
         return False
     connection = await gateway_connections_pool.get_or_add(
+        gateway_replica_model.id,
         gateway_replica_model.ip_address,
         gateway_replica_model.ssh_private_key,
     )

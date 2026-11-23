@@ -32,10 +32,6 @@ def _get_connections_dir() -> Path:
     return settings.SERVER_DIR_PATH / "gateway-connections"
 
 
-def ssh_key_digest(id_rsa: str) -> str:
-    return hashlib.sha256(id_rsa.encode()).hexdigest()
-
-
 class GatewayConnection:
     """
     `GatewayConnection` instances persist for the lifetime of the gateway replica.
@@ -45,15 +41,15 @@ class GatewayConnection:
     The reverse tunnel is used for authorizing dstack tokens.
     """
 
-    def __init__(self, ip_address: str, id_rsa: str, server_port: int):
+    def __init__(self, replica_id: uuid.UUID, ip_address: str, id_rsa: str, server_port: int):
         self._lock = aiorwlock.RWLock()
         self.stats: dict[tuple[str, str], PerWindowStats] = {}
+        self.replica_id = replica_id
         self.ip_address = ip_address
         self.server_port = server_port
         # a persistent connection_dir is needed to discover and close leftover connections
         # in case of server restarts w/o graceful shutdown
-        # Different server processes may share this directory while an IP is reassigned.
-        self.connection_dir = _get_connections_dir() / ip_address / ssh_key_digest(id_rsa)
+        self.connection_dir = _get_connections_dir() / str(replica_id)
         self._closed = False
         # connection_dir can have a long path that won't be accepted by the ssh command,
         # so we create a short temporary symlink
@@ -98,25 +94,28 @@ class GatewayConnection:
                 raise SSHError("Gateway connection is closed")
             if close_existing_tunnel:
                 # Close remaining tunnel if previous server process died w/o graceful shutdown
-                await self._close_legacy_tunnel()
+                await self._close_legacy_tunnels()
                 if await self.tunnel.acheck():
                     await self.tunnel.aclose()
             await self._open_tunnel()
 
-    async def _close_legacy_tunnel(self) -> None:
-        # Older servers placed control.sock directly under the address. Only use it
-        # for startup cleanup; management HTTP always uses the key-specific tunnel.
-        address_dir = self.connection_dir.parent
-        if not (address_dir / "control.sock").exists():
+    async def _close_legacy_tunnels(self) -> None:
+        address_dir = _get_connections_dir() / self.ip_address
+        if not address_dir.is_dir():
             return
-        temp_dir, short_path = make_tmp_symlink_to_dir(address_dir, "legacy")
-        with temp_dir:
-            legacy = SSHTunnel(
-                destination=self.tunnel.destination,
-                identity=FilePath(self.tunnel.identity_path),
-                control_sock_path=short_path / "control.sock",
-            )
-            await legacy.aclose()
+        # Older layouts used <ip> and <ip>/<key digest>. Only the upgrade cleanup
+        # needs the old digest; leave other replicas' tunnels at this address alone.
+        old_digest = hashlib.sha256(Path(self.tunnel.identity_path).read_bytes()).hexdigest()
+        for directory in (address_dir, address_dir / old_digest):
+            if (directory / "control.sock").exists():
+                temp_dir, short_path = make_tmp_symlink_to_dir(directory, "legacy")
+                with temp_dir:
+                    legacy = SSHTunnel(
+                        destination=self.tunnel.destination,
+                        identity=FilePath(self.tunnel.identity_path),
+                        control_sock_path=short_path / "control.sock",
+                    )
+                    await legacy.aclose()
 
     async def _open_tunnel(self) -> None:
         self.connection_dir.mkdir(parents=True, exist_ok=True)
@@ -145,8 +144,6 @@ class GatewayConnection:
             self._closed = True
             self.temp_dir.cleanup()
             shutil.rmtree(self.connection_dir, ignore_errors=True)
-            with contextlib.suppress(OSError):
-                self.connection_dir.parent.rmdir()
 
     async def try_collect_stats(self) -> None:
         if not self._client.is_server_ready:

@@ -145,8 +145,7 @@ async def _get_source(
     *,
     for_update: bool = False,
 ) -> tuple[uuid.UUID, uuid.UUID | None] | None:
-    # The SSH pool is keyed by address. Two active replicas at the same address or
-    # conflicting modern and legacy parents cannot reliably identify a batch source.
+    # Verify the SSH endpoint still belongs to the claimed replica before ingesting its usage.
     stmt = (
         select(
             GatewayReplicaModel.id,

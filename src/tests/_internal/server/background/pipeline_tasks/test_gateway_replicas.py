@@ -1015,8 +1015,8 @@ class TestGatewayReplicaWorkerRunningStateSync:
 
         await worker.process(_replica_to_pipeline_item(replica))
 
-        mock_gateway_connection.assert_called_once_with(
-            hostname=replica.ip_address, id_rsa="replica-private-key"
+        mock_gateway_connection.assert_awaited_once_with(
+            replica_id=replica.id, hostname=replica.ip_address, id_rsa="replica-private-key"
         )
         client_mock.register_service.assert_called_once_with(
             project=project.name,
@@ -2774,7 +2774,7 @@ class TestGatewayReplicaWorkerTerminating:
 
             get_backends_mock.assert_called_once()
             backend_mock.compute.return_value.terminate_gateway_replica.assert_called_once()
-            remove_mock.assert_called_once_with(replica.ip_address)
+            remove_mock.assert_awaited_once_with(replica.id)
 
         await session.refresh(replica)
         assert replica.status == GatewayReplicaStatus.TERMINATED

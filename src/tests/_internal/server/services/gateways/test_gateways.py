@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import ANY, AsyncMock, Mock
 
@@ -11,6 +12,9 @@ from dstack._internal.core.models.gateways import GatewayReplicaStatus, GatewayS
 from dstack._internal.proxy.gateway.const import SERVICE_SCALING_WINDOWS
 from dstack._internal.proxy.gateway.schemas.stats import Stat
 from dstack._internal.server.background.pipeline_tasks.runs import _load_gateway_stats
+from dstack._internal.server.background.scheduled_tasks.gateways import (
+    _remove_inactive_connections,
+)
 from dstack._internal.server.models import (
     GatewayModel,
     GatewayReplicaModel,
@@ -32,15 +36,38 @@ from dstack._internal.server.testing.common import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+async def test_cleanup_removes_only_inactive_replica_at_reused_address(
+    test_db, session, monkeypatch
+):
+    project = await create_project(session=session)
+    backend = await create_backend(session=session, project_id=project.id)
+    address = "192.0.2.1"
+    old = await create_gateway_replica(session, backend, ip_address=address, active=False)
+    new = await create_gateway_replica(session, backend, ip_address=address, replica_num=1)
+    connections = [Mock(replica_id=r.id, ip_address=address) for r in (old, new)]
+    pool = gateways.gateway_connections_pool
+    monkeypatch.setattr(pool, "all", AsyncMock(return_value=connections))
+    remove = AsyncMock()
+    monkeypatch.setattr(pool, "remove", remove)
+
+    await _remove_inactive_connections()
+
+    remove.assert_awaited_once_with(old.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("deleting", [False, True])
 async def test_autoscaling_uses_only_serving_gateway_stats(monkeypatch, deleting):
     healthy = GatewayReplicaModel(
+        id=uuid.uuid4(),
         ip_address="1.1.1.1",
         ssh_private_key="key",
         status=GatewayReplicaStatus.RUNNING,
         scale_in=False,
     )
     retiring = GatewayReplicaModel(
+        id=uuid.uuid4(),
         ip_address="2.2.2.2",
         ssh_private_key="key",
         status=GatewayReplicaStatus.RUNNING,
@@ -58,11 +85,11 @@ async def test_autoscaling_uses_only_serving_gateway_stats(monkeypatch, deleting
     )
     stats = {w: Stat(requests=12, request_time=0.5) for w in SERVICE_SCALING_WINDOWS}
 
-    async def get_connection(hostname, id_rsa):
+    async def get_connection(replica_id, hostname, id_rsa):
         conn = AsyncMock()
         conn.get_stats.return_value = (
             stats
-            if hostname == healthy.ip_address
+            if (replica_id, hostname) == (healthy.id, healthy.ip_address)
             else {w: Stat(requests=99, request_time=5.0) for w in SERVICE_SCALING_WINDOWS}
         )
         return conn

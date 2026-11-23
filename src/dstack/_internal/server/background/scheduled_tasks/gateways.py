@@ -30,14 +30,17 @@ async def process_gateways_connections():
 
 
 async def _remove_inactive_connections():
+    connections = await gateway_connections_pool.all()
+    if not connections:
+        return
     async with get_session_ctx() as session:
-        res = await session.execute(
-            select(GatewayReplicaModel.ip_address).where(GatewayReplicaModel.active == True)
+        res = await session.scalars(
+            select(GatewayReplicaModel.id).where(GatewayReplicaModel.active == True)
         )
-    active_connection_ips = {ip for ip in res.scalars().all() if ip is not None}
-    for conn in await gateway_connections_pool.all():
-        if conn.ip_address not in active_connection_ips:
-            await gateway_connections_pool.remove(conn.ip_address)
+        active_replica_ids = set(res)
+    for conn in connections:
+        if conn.replica_id not in active_replica_ids:
+            await gateway_connections_pool.remove(conn.replica_id)
 
 
 async def _process_active_connections():
