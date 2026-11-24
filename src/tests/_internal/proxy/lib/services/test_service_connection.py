@@ -15,7 +15,8 @@ from dstack._internal.core.services.ssh.tunnel import SSHTunnel
 from dstack._internal.proxy.lib.errors import UnexpectedProxyError
 from dstack._internal.proxy.lib.services import service_connection
 from dstack._internal.proxy.lib.services.service_connection import ServiceConnectionPool
-from dstack._internal.proxy.lib.testing.common import make_project, make_service
+from dstack._internal.proxy.lib.testing.common import make_project
+from tests._internal.proxy.gateway.common import make_service
 
 
 @pytest.fixture

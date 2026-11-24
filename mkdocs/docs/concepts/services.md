@@ -754,6 +754,10 @@ See the [reference](../reference/dstack.yml/service.md#probes) for more probe co
 If the service runs a model with an OpenAI-compatible interface, you can set the [`model`](#model) property to make the model accessible through `dstack`'s chat UI on the `Models` page.
 In this case, `dstack` will use the service's `/v1/chat/completions` service.
 
+When a [gateway](gateways.md) serves the model, it meters usage from the first authorized
+Chat Completions request. If a stream ends before the gateway can verify the final token
+counts, it records an incomplete attempt.
+
 When `model` is set, `dstack` automatically configures [`probes`](#probes) to verify model health.
 To customize or disable this, set `probes` explicitly.
 

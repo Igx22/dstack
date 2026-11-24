@@ -18,19 +18,17 @@ import httpx
 import httpx2
 import uvicorn
 
+from dstack._internal.core.models.inference_stack import InferenceStack
 from dstack._internal.proxy.gateway import app as gateway_app
 from dstack._internal.proxy.gateway.auth import GatewayProxyAuthProvider
 from dstack._internal.proxy.gateway.deps import GatewayDependencyInjector
-from dstack._internal.proxy.gateway.models import GlobalProxyConfig
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.services.metering import Clock, MeteringCollector
 from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
 from dstack._internal.proxy.gateway.services.nginx import Nginx
 from dstack._internal.proxy.gateway.services.stats import StatsCollector
 from dstack._internal.proxy.lib.models import ChatModel, OpenAIChatModelFormat
-from dstack._internal.proxy.lib.routers import model_proxy
-from dstack._internal.proxy.lib.services.usage import VLLM_PROFILE
-from dstack._internal.proxy.lib.testing.common import make_service
+from tests._internal.proxy.gateway.common import make_service
 from tests._internal.proxy.gateway.metering.backend import make_backend
 
 REQUEST_ID = contextvars.ContextVar("test_request_id", default="")
@@ -51,8 +49,8 @@ class TracingCollector(MeteringCollector):
         self.request_ids = {}
         self.checkpoint_seconds = []
 
-    def start_attempt(self, key, profile):
-        attempt = super().start_attempt(key, profile)
+    def start_attempt(self, key, rule):
+        attempt = super().start_attempt(key, rule)
         self.request_ids[attempt] = REQUEST_ID.get()
         return attempt
 
@@ -87,8 +85,23 @@ async def _worker(args) -> None:
         app = make_backend()
     else:
         repo = GatewayProxyRepo()
-        for name, service_id in [("a", "a" * 32), ("b", "b" * 32)]:
-            await repo.set_service(make_service("p", f"run-{name}", run_id=service_id))
+        dynamo = InferenceStack.model_validate(
+            {"engine": {"name": "vllm"}, "router": {"name": "dynamo", "processor": "dynamo"}}
+        )
+        for name, service_id, stack in [
+            ("a", "a" * 32, None),
+            ("b", "b" * 32, None),
+            ("progress", "c" * 32, dynamo),
+        ]:
+            await repo.set_service(
+                make_service(
+                    "p",
+                    f"run-{name}",
+                    domain="service.test" if args.nginx_url else None,
+                    run_id=service_id,
+                    inference_stack=stack,
+                )
+            )
             await repo.set_model(
                 ChatModel(
                     project_name="p",
@@ -98,23 +111,24 @@ async def _worker(args) -> None:
                     format_spec=OpenAIChatModelFormat(format="openai", prefix="/v1"),
                 )
             )
-        await repo.set_config(
-            GlobalProxyConfig(
-                usage_metering_profiles={"a" * 32: VLLM_PROFILE, "b" * 32: VLLM_PROFILE}
-            )
-        )
         clock = Clock() if args.realtime else TestClock(args.clock)
         store = MeteringStore(Path(args.state) / "usage-counters.json")
         collector = TracingCollector(store, clock=clock)
         app = gateway_app.make_app(repo=repo, nginx=TestNginx(), metering_store=store, clock=clock)
         auth_client = httpx2.AsyncClient(base_url=args.backend, timeout=10)
-        backend_client = httpx.AsyncClient(
-            base_url=args.nginx_url or args.backend,
-            headers={"Host": "service.test"} if args.nginx_url else {},
-            timeout=30,
-        )
+        backend_client = httpx.AsyncClient(base_url=args.backend, timeout=30)
         http_clients = [auth_client, backend_client]
-        app.state.proxy_dependency_injector = GatewayDependencyInjector(
+
+        class TestGatewayInjector(GatewayDependencyInjector):
+            async def get_service_replica_client(self, service, repo):
+                if args.nginx_url:
+                    client = await super().get_service_replica_client(service, repo)
+                    client.base_url = httpx.URL(args.nginx_url)
+                    http_clients.append(client)
+                    return client
+                return backend_client
+
+        app.state.proxy_dependency_injector = TestGatewayInjector(
             repo=repo,
             auth=GatewayProxyAuthProvider(auth_client),
             nginx=TestNginx(),
@@ -122,11 +136,6 @@ async def _worker(args) -> None:
             metering=collector,
         )
         gateway_app.apply_all = _noop
-
-        async def connection(*args, **kwargs):
-            return backend_client
-
-        model_proxy.get_service_replica_client = connection
 
         @app.middleware("http")
         async def trace(request, call_next):

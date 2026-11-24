@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.schemas.services import (
     ServiceListItem,
@@ -14,7 +16,7 @@ async def list_services(repo: GatewayProxyRepo) -> ServiceListResponse:
     return await run_async(_get_service_list_response, services)
 
 
-def _get_service_list_response(services: list[Service]) -> ServiceListResponse:
+def _get_service_list_response(services: Sequence[Service]) -> ServiceListResponse:
     return ServiceListResponse(
         services=[
             ServiceListItem(

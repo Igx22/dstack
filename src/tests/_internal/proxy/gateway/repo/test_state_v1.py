@@ -5,7 +5,12 @@ import pytest
 from pydantic import AnyHttpUrl
 
 from dstack._internal.core.models.instances import SSHConnectionParams
-from dstack._internal.proxy.gateway.models import ACMESettings, GlobalProxyConfig, ModelEntrypoint
+from dstack._internal.proxy.gateway.models import (
+    ACMESettings,
+    GatewayService,
+    GlobalProxyConfig,
+    ModelEntrypoint,
+)
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.repo.state_v1 import migrate_from_state_v1
 from dstack._internal.proxy.lib.models import (
@@ -13,7 +18,6 @@ from dstack._internal.proxy.lib.models import (
     OpenAIChatModelFormat,
     Project,
     Replica,
-    Service,
     TGIChatModelFormat,
 )
 from dstack._internal.proxy.lib.testing.common import make_project
@@ -293,7 +297,7 @@ async def test_migrate_from_state_v1(tmp_path: Path) -> None:
         ModelEntrypoint(project_name="proj-2", domain="gateway.proj-2.gateway.test", https=True),
     ]
     assert sorted(await repo.list_services(), key=lambda s: (s.project_name, s.run_name)) == [
-        Service(
+        GatewayService(
             project_name="proj-1",
             run_name="run-1",
             domain="run-1.proj-1.gateway.test",
@@ -310,7 +314,7 @@ async def test_migrate_from_state_v1(tmp_path: Path) -> None:
                 ),
             ),
         ),
-        Service(
+        GatewayService(
             project_name="proj-2",
             run_name="run-2",
             domain="run-2.proj-2.gateway.test",
@@ -342,7 +346,7 @@ async def test_migrate_from_state_v1(tmp_path: Path) -> None:
                 ),
             ),
         ),
-        Service(
+        GatewayService(
             project_name="proj-2",
             run_name="run-3",
             domain="run-3.proj-2.gateway.test",

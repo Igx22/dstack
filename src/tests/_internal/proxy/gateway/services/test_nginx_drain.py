@@ -97,6 +97,7 @@ async def test_ordinary_response_finishes_before_nginx_is_drained(
         # IPv6 loopback exercises the public ACL, while the model proxy uses exactly 127.0.0.1.
         site = ServiceConfig(
             domain="service.test",
+            route_key="aabb",
             project_name="p",
             https=False,
             auth=False,

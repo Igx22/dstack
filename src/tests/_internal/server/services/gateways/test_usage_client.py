@@ -35,6 +35,7 @@ async def test_drain_requires_explicit_confirmation(status, payload, error):
 @pytest.mark.parametrize("version", [1, 2])
 async def test_usage_client_contract(version):
     seen = []
+    raw_batch = {"batch_id": "b", "entries": [{"future_field": None}]}
 
     def response(request):
         seen.append(request)
@@ -44,7 +45,7 @@ async def test_usage_client_contract(version):
                 200,
                 json={
                     "schema_version": version,
-                    "batches": [],
+                    "batches": [raw_batch],
                     "has_more": False,
                     **({"collector_id": "c"} if version == 1 else {}),
                 },
@@ -58,6 +59,7 @@ async def test_usage_client_contract(version):
         client._client = http
         page = await client.fetch_usage_batches(2)
         assert page.schema_version == 2
+        assert page.batches == [raw_batch]
         assert "collector_id" not in page.model_dump()
         assert (await client.acknowledge_usage(["b"])).acknowledged_batch_ids == ["b"]
         assert all(r.extensions["timeout"]["read"] == 10 for r in seen)
@@ -78,7 +80,16 @@ async def test_usage_client_http_errors(code):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "payload", [{}, {"schema_version": 3}, {"schema_version": 2, "collector_id": "spoofed"}]
+    "payload",
+    [
+        {},
+        {"schema_version": 1, "collector_id": "legacy"},
+        {"schema_version": 2},
+        {"schema_version": 2, "batches": None},
+        {"schema_version": 2, "batches": [None] * 101},
+        {"schema_version": 3, "batches": []},
+        {"schema_version": 2, "collector_id": "spoofed", "batches": []},
+    ],
 )
 async def test_usage_client_rejects_malformed_data(payload):
     client = GatewayClient(port=1)

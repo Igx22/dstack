@@ -5,6 +5,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from dstack._internal.core.models.inference_stack import InferenceStack
 from dstack._internal.proxy.gateway.deps import get_metering
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.routers.usage import router as usage_router
@@ -17,8 +18,9 @@ from dstack._internal.proxy.lib.routers.model_proxy import router as model_route
 from dstack._internal.proxy.lib.schemas.model_proxy import ChatCompletionsRequest
 from dstack._internal.proxy.lib.schemas.usage import AuthorizedSubject, UsageKey
 from dstack._internal.proxy.lib.services.model_proxy.clients.openai import OpenAIChatCompletions
-from dstack._internal.proxy.lib.services.usage import VLLM_PROFILE
-from dstack._internal.proxy.lib.testing.common import ProxyTestDependencyInjector, make_service
+from dstack._internal.proxy.lib.services.usage import UsageRule
+from dstack._internal.proxy.lib.testing.common import ProxyTestDependencyInjector
+from tests._internal.proxy.gateway.common import make_service
 from tests._internal.proxy.gateway.services.test_metering import FakeClock
 
 USAGE = {
@@ -27,6 +29,17 @@ USAGE = {
     "total_tokens": 23,
     "prompt_tokens_details": {"cached_tokens": 5},
 }
+
+
+SMG_VLLM = InferenceStack.model_validate(
+    {"engine": {"name": "vllm"}, "router": {"name": "smg", "transport": "http"}}
+)
+DYNAMO_VLLM = InferenceStack.model_validate(
+    {"engine": {"name": "sglang"}, "router": {"name": "dynamo", "processor": "vllm"}}
+)
+DYNAMO_NATIVE = InferenceStack.model_validate(
+    {"engine": {"name": "vllm"}, "router": {"name": "dynamo", "processor": "dynamo"}}
+)
 
 
 class FragmentedStream(httpx.AsyncByteStream):
@@ -46,11 +59,11 @@ class FragmentedStream(httpx.AsyncByteStream):
 @pytest.mark.parametrize("stream,include_usage", [(False, False), (True, True), (True, False)])
 async def test_backend_usage_is_observed_and_forwarded(tmp_path, stream, include_usage):
     clock = FakeClock()
-    c = MeteringCollector(
-        MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-    )
+    c = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
     await c.start()
-    attempt = c.start_attempt(UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE)
+    attempt = c.start_attempt(
+        UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
+    )
     requests = []
     response = {"id": "answer", "created": 1, "model": "test", "choices": [], "usage": USAGE}
     content = {"model": "test", "choices": [{"index": 0, "delta": {"content": "Hello"}}]}
@@ -120,11 +133,11 @@ async def test_backend_usage_is_observed_and_forwarded(tmp_path, stream, include
 @pytest.mark.asyncio
 async def test_truncated_stream_is_unknown_not_synthetic_done(tmp_path):
     clock = FakeClock()
-    c = MeteringCollector(
-        MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-    )
+    c = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
     await c.start()
-    attempt = c.start_attempt(UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE)
+    attempt = c.start_attempt(
+        UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
+    )
     stream = FragmentedStream(b'data: {"model":"test","choices":[]}\n\n')
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=stream)),
@@ -165,13 +178,13 @@ class MeteredInjector(ProxyTestDependencyInjector):
 
 
 @asynccontextmanager
-async def metered_endpoint(tmp_path, monkeypatch, profile, backend_handler):
+async def metered_endpoint(tmp_path, monkeypatch, stack, backend_handler):
     clock = FakeClock()
     collector = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
-    await collector.configure_profiles({"s": profile})
+    await collector.start()
     try:
         repo = GatewayProxyRepo()
-        await repo.set_service(make_service("p", "run", run_id="s"))
+        await repo.set_service(make_service("p", "run", run_id="s", inference_stack=stack))
         await repo.set_model(
             ChatModel(
                 project_name="p",
@@ -201,7 +214,8 @@ async def metered_endpoint(tmp_path, monkeypatch, profile, backend_handler):
                 return backend
 
             monkeypatch.setattr(
-                "dstack._internal.proxy.lib.routers.model_proxy.get_service_replica_client",
+                app.state.proxy_dependency_injector,
+                "get_service_replica_client",
                 connection,
             )
             yield client, collector, clock
@@ -243,6 +257,29 @@ async def public_chat(client, **options):
     )
 
 
+@pytest.mark.asyncio
+async def test_denied_or_unadmitted_request_never_reaches_model(tmp_path, monkeypatch):
+    def backend(request):
+        pytest.fail("The Gateway dispatched a rejected request")
+
+    async with metered_endpoint(tmp_path, monkeypatch, None, backend) as (
+        client,
+        collector,
+        clock,
+    ):
+        response = await client.post(
+            "/models/p/chat/completions",
+            headers={"Authorization": "Bearer denied"},
+            json={"model": "test", "messages": []},
+        )
+        assert response.status_code == 403
+        collector.max_entries = 0
+        assert (await public_chat(client)).status_code == 503
+        clock.advance()
+        await collector.rotate_if_due()
+        assert (await collector.get_batches()).batches == []
+
+
 def public_events(response):
     assert response.status_code == 200
     data = [line[5:].strip() for line in response.text.splitlines() if line.startswith("data:")]
@@ -256,6 +293,122 @@ async def close_minute(collector, clock):
     (batch,) = (await collector.get_batches()).batches
     (entry,) = batch.entries
     return entry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "engine,router,expected_output,incomplete",
+    [
+        ("vllm", {"name": "smg", "transport": "http"}, 16, False),
+        ("sglang", {"name": "smg", "transport": "http"}, 0, True),
+        ("vllm", {"name": "dynamo", "processor": "vllm"}, 10, False),
+        ("sglang", {"name": "dynamo", "processor": "vllm"}, 10, False),
+        ("vllm", {"name": "dynamo", "processor": "dynamo"}, 10, True),
+        ("sglang", {"name": "dynamo", "processor": "dynamo"}, 10, True),
+        ("vllm", None, 0, True),
+        ("vllm", {"name": "smg"}, 0, True),
+        ("sglang", {"name": "dynamo"}, 0, True),
+        ("sglang", {"name": "dynamo", "processor": "sglang"}, 0, True),
+        ("custom", {"name": "dynamo", "processor": "dynamo"}, 0, True),
+    ],
+)
+async def test_multi_choice_usage_follows_registered_stack(
+    tmp_path, monkeypatch, engine, router, expected_output, incomplete
+):
+    stack = InferenceStack.model_validate(
+        {
+            "engine": {"name": engine, "version": "unlisted-version"},
+            "router": {**router, "version": "unlisted-version"} if router else None,
+        }
+    )
+    options = []
+
+    def backend(request):
+        options.append(json.loads(request.content)["stream_options"])
+        return sse_reply(
+            [
+                sse_choice(0, usage=token_counts(12, 3)),
+                sse_choice(1, usage=token_counts(12, 5)),
+                sse_choice(0, finish_reason="stop", usage=token_counts(12, 6)),
+                sse_choice(1, finish_reason="stop", usage=token_counts(12, 10)),
+            ]
+        )
+
+    async with metered_endpoint(tmp_path, monkeypatch, stack, backend) as (
+        client,
+        collector,
+        clock,
+    ):
+        reply = await public_chat(client, stream=True, n=2, stream_options={"include_usage": True})
+        events = public_events(reply)
+        entry = await close_minute(collector, clock)
+        expected_options = {"include_usage": True}
+        if expected_output:
+            expected_options["continuous_usage_stats"] = True
+        assert options == [expected_options]
+        if incomplete:
+            assert all(event["choices"] for event in events)
+        else:
+            assert events[-1]["usage"]["completion_tokens"] == expected_output
+        assert entry.prompt_tokens == (0 if incomplete else 12)
+        assert entry.completion_tokens == expected_output
+        assert entry.unknown_usage_attempts == int(incomplete)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "cache,expected",
+    [
+        ({}, 0),
+        ({"prompt_tokens_details": None}, 0),
+        ({"prompt_tokens_details": {}}, 0),
+        ({"prompt_tokens_details": {"cached_tokens": None}}, 0),
+        ({"prompt_tokens_details": {"cached_tokens": 5}}, 5),
+    ],
+)
+async def test_final_usage_preserves_totals_with_optional_cache(
+    tmp_path, monkeypatch, stream, cache, expected
+):
+    final = {**sse_choice(0), "choices": [], "usage": {**token_counts(12, 8), **cache}}
+
+    def backend(request):
+        return sse_reply([final]) if stream else httpx.Response(200, json=final)
+
+    async with metered_endpoint(tmp_path, monkeypatch, None, backend) as (
+        client,
+        collector,
+        clock,
+    ):
+        result = await public_chat(client, stream=stream)
+        assert result.status_code == 200
+        entry = await close_minute(collector, clock)
+        assert (
+            entry.prompt_tokens,
+            entry.completion_tokens,
+            entry.total_tokens,
+            entry.cached_prompt_tokens,
+            entry.unknown_usage_attempts,
+        ) == (12, 8, 20, expected, 0)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_cache_details_do_not_confirm_partial_prompt(tmp_path, monkeypatch):
+    usage = {**token_counts(12, 8), "prompt_tokens_details": {"cached_tokens": None}}
+    async with metered_endpoint(
+        tmp_path,
+        monkeypatch,
+        SMG_VLLM,
+        lambda request: sse_reply([sse_choice(0, content="Hi", usage=usage)], done=False),
+    ) as (client, collector, clock):
+        result = await public_chat(client, stream=True)
+        assert "data: [DONE]" not in result.text
+        entry = await close_minute(collector, clock)
+        assert (entry.prompt_tokens, entry.completion_tokens, entry.unknown_usage_attempts) == (
+            0,
+            8,
+            1,
+        )
 
 
 @pytest.mark.asyncio
@@ -276,7 +429,7 @@ async def test_dynamo_inline_usage_preserves_last_text_and_settles_once(
             ]
         )
 
-    async with metered_endpoint(tmp_path, monkeypatch, "dynamo-1.6.2-vllm", backend) as (
+    async with metered_endpoint(tmp_path, monkeypatch, DYNAMO_VLLM, backend) as (
         client,
         collector,
         clock,
@@ -310,7 +463,7 @@ async def test_dynamo_inline_usage_preserves_last_text_and_settles_once(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("per_choice", [False, True])
 @pytest.mark.parametrize("done", [False, True])
-async def test_stream_counts_interleaved_choices_using_profile(
+async def test_stream_counts_interleaved_choices_for_registered_stack(
     tmp_path, monkeypatch, per_choice, done
 ):
     first_finish = sse_choice(
@@ -327,9 +480,9 @@ async def test_stream_counts_interleaved_choices_using_profile(
                 ),
             ]
         )
-    profile = "vllm-0.19.1-per-choice" if per_choice else "dynamo-1.6.2-vllm"
+    stack = SMG_VLLM if per_choice else DYNAMO_VLLM
     async with metered_endpoint(
-        tmp_path, monkeypatch, profile, lambda request: sse_reply(events, done=done)
+        tmp_path, monkeypatch, stack, lambda request: sse_reply(events, done=done)
     ) as (client, collector, clock):
         reply = await public_chat(client, stream=True, n=2, stream_options={"include_usage": True})
         if done:
@@ -356,7 +509,7 @@ async def test_replayed_earlier_finish_cannot_supply_missing_final_total(tmp_pat
         first_finish,
     ]
     async with metered_endpoint(
-        tmp_path, monkeypatch, "dynamo-1.6.2-vllm", lambda request: sse_reply(events)
+        tmp_path, monkeypatch, DYNAMO_VLLM, lambda request: sse_reply(events)
     ) as (client, collector, clock):
         reply = await public_chat(client, stream=True, n=2, stream_options={"include_usage": True})
         assert all(event["choices"] and event["usage"] is None for event in public_events(reply))
@@ -381,7 +534,7 @@ async def test_inconsistent_progress_does_not_displace_last_verified_prefix(
             sse_choice(0, finish_reason="stop", usage=token_counts(10, 4, cached=5)),
         ]
     async with metered_endpoint(
-        tmp_path, monkeypatch, "vllm-0.19.1-per-choice", lambda request: sse_reply(events)
+        tmp_path, monkeypatch, SMG_VLLM, lambda request: sse_reply(events)
     ) as (client, collector, clock):
         reply = await public_chat(client, stream=True, stream_options={"include_usage": True})
         assert all(event["choices"] and event["usage"] is None for event in public_events(reply))
@@ -411,7 +564,7 @@ async def test_final_usage_supersedes_progress_and_public_extension_is_rejected(
             ]
         )
 
-    async with metered_endpoint(tmp_path, monkeypatch, "dynamo-1.6.2-rust", backend) as (
+    async with metered_endpoint(tmp_path, monkeypatch, DYNAMO_NATIVE, backend) as (
         client,
         collector,
         clock,
@@ -444,9 +597,7 @@ async def test_final_usage_supersedes_progress_and_public_extension_is_rejected(
 )
 async def test_model_handler_finalizes_verified_usage(tmp_path, monkeypatch, stream, metadata):
     clock = FakeClock()
-    collector = MeteringCollector(
-        MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-    )
+    collector = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
     await collector.start()
     repo = GatewayProxyRepo()
     await repo.set_service(make_service("p", "run", run_id="s"))
@@ -478,7 +629,7 @@ async def test_model_handler_finalizes_verified_usage(tmp_path, monkeypatch, str
             return backend
 
         monkeypatch.setattr(
-            "dstack._internal.proxy.lib.routers.model_proxy.get_service_replica_client", connection
+            app.state.proxy_dependency_injector, "get_service_replica_client", connection
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://gateway"
@@ -516,12 +667,10 @@ async def test_model_handler_finalizes_verified_usage(tmp_path, monkeypatch, str
 @pytest.mark.parametrize("intermediate_only", [True, False])
 async def test_confirmed_final_usage_survives_invalid_duplicates(tmp_path, intermediate_only):
     clock = FakeClock()
-    collector = MeteringCollector(
-        MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-    )
+    collector = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
     await collector.start()
     attempt = collector.start_attempt(
-        UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE
+        UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
     )
     final = {"model": "test", "choices": [], "usage": USAGE}
     if intermediate_only:

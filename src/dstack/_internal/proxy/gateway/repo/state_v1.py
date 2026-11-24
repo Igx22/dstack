@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from dstack._internal.core.models.instances import SSHConnectionParams
-from dstack._internal.proxy.gateway.models import ACMESettings, GlobalProxyConfig, ModelEntrypoint
+from dstack._internal.proxy.gateway.models import (
+    ACMESettings,
+    GatewayService,
+    GlobalProxyConfig,
+    ModelEntrypoint,
+)
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo, State
 from dstack._internal.proxy.lib.models import (
     AnyModelFormat,
@@ -17,7 +22,6 @@ from dstack._internal.proxy.lib.models import (
     OpenAIChatModelFormat,
     Project,
     Replica,
-    Service,
     TGIChatModelFormat,
 )
 from dstack._internal.utils.logging import get_logger
@@ -48,20 +52,20 @@ def parse_state_v1(state_v1: dict, keys_dir: Path) -> State:
 
 def get_services_models(
     state_v1: dict,
-) -> tuple[dict[str, dict[str, Service]], dict[str, dict[str, ChatModel]]]:
+) -> tuple[dict[str, dict[str, GatewayService]], dict[str, dict[str, ChatModel]]]:
     service_id_to_project_name = {}
     for project_name, project_services in state_v1.get("store", {}).get("projects", {}).items():
         for service_id in project_services:
             service_id_to_project_name[service_id] = project_name
 
-    services: dict[str, dict[str, Service]] = {}
+    services: dict[str, dict[str, GatewayService]] = {}
     models: dict[str, dict[str, ChatModel]] = {}
     for service in state_v1.get("store", {}).get("services", {}).values():
         project_name = service_id_to_project_name[service["id"]]
         replicas = []
         for replica in service.get("replicas", []):
             replicas.append(parse_replica(replica))
-        parsed_service = Service(
+        parsed_service = GatewayService(
             project_name=project_name,
             run_name=service["domain"].split(".")[0],
             domain=service["domain"],

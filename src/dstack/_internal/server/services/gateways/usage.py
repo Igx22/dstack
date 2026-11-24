@@ -1,20 +1,23 @@
 """Fetch durable minute batches, commit usage rows, then ACK over SSH."""
 
 import asyncio
+import json
 import sqlite3
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager, nullcontext
 
 import httpx
+from pydantic import JsonValue, TypeAdapter, ValidationError
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dstack._internal.proxy.lib.schemas.usage import UsageBatch
+from dstack._internal.proxy.lib.schemas.usage import Identifier, UsageBatch
 from dstack._internal.server.db import get_db, get_session_ctx
 from dstack._internal.server.models import GatewayModel, GatewayReplicaModel
 from dstack._internal.server.services.gateways.connection import GatewayConnection
-from dstack._internal.server.services.usage import UsageConflict, ingest_usage_batch
+from dstack._internal.server.services.usage import InvalidUsageBatch, ingest_usage_batch
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -22,6 +25,7 @@ PAGE_SIZE = 100
 MAX_PAGES = 10
 COLLECTION_TIMEOUT = 12
 _sqlite_ingestion_lock = asyncio.Lock()
+_batch_identifier = TypeAdapter(Identifier)
 
 
 async def collect_gateway_usage(
@@ -90,8 +94,11 @@ async def _collect_pages(
         async with connection.client() as client:
             page = await client.fetch_usage_batches(PAGE_SIZE)
         if not page.batches:
-            return True
-        rejected: list[tuple[UsageBatch, str]] = []
+            return not page.has_more
+        batch_ids = [_read_batch_id(payload) for payload in page.batches]
+        counts = Counter(batch_ids)
+        acknowledged: list[str] = []
+        rejected: list[tuple[str | None, JsonValue, str]] = []
         async with _ingestion_session() as session:
             # The lease or source may have changed while GET was in flight.
             current = await _get_source(
@@ -99,42 +106,70 @@ async def _collect_pages(
             )
             if current != source:
                 return False
-            for batch in page.batches:
-                try:
-                    # A missing user on a later row must undo this batch's earlier rows.
-                    async with session.begin_nested():
-                        await ingest_usage_batch(session, replica_id, gateway_id, batch)
-                except UsageConflict as exc:
+            for batch_id, payload in zip(batch_ids, page.batches):
+                if batch_id is not None and counts[batch_id] > 1:
+                    reason = "Duplicate batch ID in the same page"
+                else:
+                    reason = await _ingest_received_batch(session, replica_id, gateway_id, payload)
+                if reason is not None:
+                    rejected.append((batch_id, payload, reason))
+                    # An unbound replica may only ACK an exact replay.
                     if gateway_id is None:
-                        raise  # An unbound replica may only ACK an exact replay.
-                    rejected.append((batch, str(exc)))
-                except IntegrityError as exc:
-                    if not _is_foreign_key_violation(exc):
-                        raise
-                    # usage_batches has one foreign key: user_id references users.id.
-                    rejected.append((batch, "Referenced user does not exist"))
+                        continue
+                if batch_id is not None and counts[batch_id] == 1:
+                    acknowledged.append(batch_id)
         # The page has committed. Log every rejected payload before allowing its removal.
-        for batch, reason in rejected:
+        for batch_id, payload, reason in rejected:
             logger.error(
-                "Could not insert usage batch from Gateway %s replica %s: %s. Batch: %s",
+                "Could not insert usage batch %r from Gateway %s replica %s: %s. Batch: %s",
+                batch_id,
                 gateway_id,
                 replica_id,
                 reason,
-                batch.model_dump_json(),
+                json.dumps(payload, separators=(",", ":")),
             )
-        ids = [batch.batch_id for batch in page.batches]
+        if not acknowledged:
+            return False
         async with connection.client() as client:
-            await client.acknowledge_usage(ids)
+            await client.acknowledge_usage(acknowledged)
         if not page.has_more:
-            return True
+            return len(acknowledged) == len(page.batches)
     return False
 
 
-def _is_foreign_key_violation(exc: IntegrityError) -> bool:
-    return (
-        getattr(exc.orig, "sqlstate", None) == "23503"
-        or getattr(exc.orig, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
-    )
+def _read_batch_id(payload: JsonValue) -> str | None:
+    if isinstance(payload, dict):
+        try:
+            return _batch_identifier.validate_python(payload.get("batch_id"))
+        except ValidationError:
+            pass
+    return None
+
+
+async def _ingest_received_batch(
+    session: AsyncSession, replica_id: uuid.UUID, gateway_id: uuid.UUID | None, payload: JsonValue
+) -> str | None:
+    try:
+        batch = UsageBatch.model_validate(payload)
+        # A bad later row must undo this batch's earlier rows.
+        async with session.begin_nested():
+            await ingest_usage_batch(session, replica_id, gateway_id, batch)
+    except (ValidationError, InvalidUsageBatch) as exc:
+        return str(exc)
+    except DBAPIError as exc:
+        # asyncpg exposes some data exceptions as generic DBAPIError; use the driver code.
+        sqlstate = getattr(exc.orig, "sqlstate", "") or ""
+        sqlite_code = getattr(exc.orig, "sqlite_errorcode", None)
+        if exc.connection_invalidated:
+            raise
+        if sqlstate == "23503" or sqlite_code == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
+            # usage_batches has one foreign key: user_id references users.id.
+            return "Referenced user does not exist"
+        sqlite_data_errors = (sqlite3.SQLITE_CONSTRAINT_CHECK, sqlite3.SQLITE_TOOBIG)
+        if sqlstate.startswith("22") or sqlstate == "23514" or sqlite_code in sqlite_data_errors:
+            return str(exc.orig)
+        raise
+    return None
 
 
 async def _get_source(

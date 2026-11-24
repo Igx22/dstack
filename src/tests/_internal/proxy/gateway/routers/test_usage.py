@@ -7,7 +7,7 @@ from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
 from dstack._internal.proxy.gateway.services.nginx import Nginx
 from dstack._internal.proxy.lib.errors import ProxyError
 from dstack._internal.proxy.lib.schemas.usage import UsageKey
-from dstack._internal.proxy.lib.services.usage import VLLM_PROFILE
+from dstack._internal.proxy.lib.services.usage import UsageRule
 from tests._internal.proxy.gateway.services.test_metering import FakeClock, record
 
 
@@ -24,7 +24,6 @@ async def test_fetch_and_ack_preserve_active_and_reject_active_ids(tmp_path):
     store = MeteringStore(tmp_path / "usage.json")
     app = make_app(repo=GatewayProxyRepo(), metering_store=store, clock=clock)
     collector = app.state.proxy_dependency_injector.get_usage_observer()
-    collector.profiles = {"s": VLLM_PROFILE}
     await collector.start()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://control"
@@ -62,7 +61,7 @@ async def test_fetch_and_ack_preserve_active_and_reject_active_ids(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_drain_of_unused_replica_is_durable_before_profiles_are_configured(tmp_path):
+async def test_drain_of_unused_replica_is_durable_after_restart(tmp_path):
     path = tmp_path / "usage.json"
     for restart in [False, True]:
         app = make_app(
@@ -75,10 +74,9 @@ async def test_drain_of_unused_replica_is_durable_before_profiles_are_configured
                 transport=httpx.ASGITransport(app=app), base_url="http://control"
             ) as client:
                 if restart:
-                    await collector.configure_profiles({"s": VLLM_PROFILE})
                     with pytest.raises(ProxyError) as exc:
                         collector.start_attempt(
-                            UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE
+                            UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
                         )
                     assert exc.value.status_code == 503
                 response = await client.post("/api/usage/drain")
@@ -98,7 +96,7 @@ async def test_traffic_accepted_by_old_nginx_worker_with_gateway_restart(tmp_pat
     clock = FakeClock()
     app = make_app(repo=GatewayProxyRepo(), nginx=nginx, metering_store=store, clock=clock)
     collector = app.state.proxy_dependency_injector.get_metering()
-    await collector.configure_profiles({"s": VLLM_PROFILE})
+    await collector.start()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://control"
     ) as client:
@@ -114,7 +112,7 @@ async def test_traffic_accepted_by_old_nginx_worker_with_gateway_restart(tmp_pat
         repo=GatewayProxyRepo(), nginx=nginx, metering_store=MeteringStore(store.path), clock=clock
     )
     collector = app.state.proxy_dependency_injector.get_metering()
-    await collector.configure_profiles({"s": VLLM_PROFILE})
+    await collector.start()
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://control"
@@ -143,7 +141,7 @@ async def test_final_ack_still_requires_current_ingress_proof(tmp_path):
         repo=GatewayProxyRepo(), nginx=nginx, metering_store=MeteringStore(tmp_path / "usage.json")
     )
     collector = app.state.proxy_dependency_injector.get_metering()
-    await collector.configure_profiles({"s": VLLM_PROFILE})
+    await collector.start()
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://control"

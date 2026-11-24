@@ -22,7 +22,11 @@ _COUNTER_FIELDS = (
 _MAX_COUNTER = 2**63 - 1
 
 
-class UsageConflict(ValueError):
+class InvalidUsageBatch(ValueError):
+    """A batch contains data that cannot be stored as usage rows."""
+
+
+class UsageConflict(InvalidUsageBatch):
     """An incoming usage batch cannot be reconciled with its stored history."""
 
 
@@ -113,17 +117,17 @@ async def ingest_usage_batch(
 
 def _normalize_entries(batch: UsageBatch) -> dict[tuple[uuid.UUID, uuid.UUID], dict[str, int]]:
     if not batch.entries:
-        raise ValueError("Usage batch must contain at least one entry")
+        raise InvalidUsageBatch("Usage batch must contain at least one entry")
     entries = {}
     for entry in batch.entries:
         try:
             key = uuid.UUID(entry.consumer_subject_id), uuid.UUID(entry.service_id)
         except ValueError as exc:
-            raise ValueError("Usage entry requires valid user and run UUIDs") from exc
+            raise InvalidUsageBatch("Usage entry requires valid user and run UUIDs") from exc
         if key in entries:
-            raise ValueError("Duplicate usage key after UUID normalization")
+            raise InvalidUsageBatch("Duplicate usage key after UUID normalization")
         counters = {name: getattr(entry, name) for name in _COUNTER_FIELDS}
         if any(value > _MAX_COUNTER for value in counters.values()):
-            raise ValueError("Usage counter exceeds signed 64-bit storage")
+            raise InvalidUsageBatch("Usage counter exceeds signed 64-bit storage")
         entries[key] = counters
     return entries

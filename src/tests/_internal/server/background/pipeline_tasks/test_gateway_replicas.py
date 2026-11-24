@@ -17,6 +17,7 @@ from dstack._internal.core.models.gateways import (
     GatewayReplicaStatus,
     GatewayStatus,
 )
+from dstack._internal.core.models.inference_stack import InferenceStack
 from dstack._internal.core.models.instances import (
     InstanceStatus,
     RemoteConnectionInfo,
@@ -25,7 +26,7 @@ from dstack._internal.core.models.instances import (
 )
 from dstack._internal.core.models.runs import JobStatus, RunStatus, ServiceSpec
 from dstack._internal.proxy.gateway.schemas.services import ServiceListItem, ServiceListReplicaItem
-from dstack._internal.proxy.lib.schemas.usage import UsageBatchPage, UsageDrainResponse
+from dstack._internal.proxy.lib.schemas.usage import UsageDrainResponse
 from dstack._internal.server import settings
 from dstack._internal.server.background.pipeline_tasks.gateway_replicas import (
     GatewayReplicaFetcher,
@@ -39,6 +40,8 @@ from dstack._internal.server.models import (
     ServiceReplicaRegistrationModel,
     UsageBatchModel,
 )
+from dstack._internal.server.services.gateways.client import ReceivedUsagePage
+from dstack._internal.server.services.services.options import get_service_options
 from dstack._internal.server.testing.common import (
     AsyncContextManager,
     ComputeMockSpec,
@@ -687,7 +690,9 @@ class TestGatewayReplicaWorkerRunning:
         await session.commit()
         mock_gateway_connection.return_value.ip_address = replica.ip_address
         client = _get_client_mock(mock_gateway_connection)
-        client.fetch_usage_batches.return_value = UsageBatchPage(batches=[batch(user.id)])
+        client.fetch_usage_batches.return_value = ReceivedUsagePage(
+            batches=[batch(user.id).model_dump(mode="json")]
+        )
         client.list_services.return_value = []
 
         await worker.process(_replica_to_pipeline_item(replica))
@@ -791,7 +796,9 @@ class TestGatewayReplicaWorkerRunning:
         )
         if waiting == "ack_failed":
             user = await create_user(session)
-            client.fetch_usage_batches.return_value = UsageBatchPage(batches=[batch(user.id)])
+            client.fetch_usage_batches.return_value = ReceivedUsagePage(
+                batches=[batch(user.id).model_dump(mode="json")]
+            )
             client.acknowledge_usage.side_effect = TimeoutError("ACK timed out")
         elif waiting == "unreachable":
             client.drain_usage.side_effect = TimeoutError("Gateway is unavailable")
@@ -942,7 +949,9 @@ class TestGatewayReplicaWorkerRunningStateSync:
         job_registered: bool = True,
         replica_num: int = 0,
         service_url: Optional[str] = None,
+        configuration: Optional[ServiceConfiguration] = None,
     ):
+        configuration = configuration or ServiceConfiguration(port=80, image="ubuntu")
         run = await create_run(
             session=session,
             project=project,
@@ -953,12 +962,13 @@ class TestGatewayReplicaWorkerRunningStateSync:
             run_spec=get_run_spec(
                 run_name=run_name,
                 repo_id=repo.name,
-                configuration=ServiceConfiguration(port=80, image="ubuntu"),
+                configuration=configuration,
             ),
             gateway=gateway,
         )
         run.service_spec = ServiceSpec(
-            url=service_url or f"https://{run_name}.example.com"
+            url=service_url or f"https://{run_name}.example.com",
+            options=get_service_options(configuration),
         ).model_dump_json()
         await session.commit()
         fleet = await create_fleet(session=session, project=project)
@@ -1005,7 +1015,32 @@ class TestGatewayReplicaWorkerRunningStateSync:
             ssh_private_key="replica-private-key",
         )
         run, job = await self._create_service_run_and_job(
-            session, project, repo, user, gateway, run_name="test-service"
+            session,
+            project,
+            repo,
+            user,
+            gateway,
+            run_name="test-service",
+            configuration=ServiceConfiguration.model_validate(
+                {
+                    "port": 80,
+                    "image": "custom",
+                    "model": "test",
+                    "groups": [
+                        {
+                            "name": "frontend",
+                            "replicas": 1,
+                            "router": {"type": "dynamo"},
+                            "commands": ["python3 -m dynamo.frontend --dyn-chat-processor vllm"],
+                        },
+                        {
+                            "name": "workers",
+                            "replicas": 1,
+                            "commands": ["python3 -m dynamo.sglang --model test"],
+                        },
+                    ],
+                }
+            ),
         )
         _lock_replica(replica)
         await session.commit()
@@ -1028,10 +1063,20 @@ class TestGatewayReplicaWorkerRunningStateSync:
             auth=ANY,
             client_max_body_size=ANY,
             read_timeout=900,
-            options={},
+            options={
+                "openai": {
+                    "model": {"name": "test", "type": "chat", "format": "openai", "prefix": "/v1"}
+                }
+            },
             rate_limits=[],
             ssh_private_key=project.ssh_private_key,
-            has_router_replica=False,
+            has_router_replica=True,
+            inference_stack=InferenceStack.model_validate(
+                {
+                    "engine": {"name": "sglang"},
+                    "router": {"name": "dynamo", "processor": "vllm"},
+                }
+            ),
         )
         client_mock.register_replica.assert_called_once_with(
             project=project.name,
@@ -1658,6 +1703,7 @@ class TestGatewayReplicaWorkerRunningStateSync:
             rate_limits=[],
             ssh_private_key=project.ssh_private_key,
             has_router_replica=False,
+            inference_stack=None,
         )
         client_mock.register_replica.assert_called_once_with(
             project=project.name,

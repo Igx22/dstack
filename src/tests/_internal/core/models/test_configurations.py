@@ -169,6 +169,18 @@ class TestParseConfiguration:
         assert isinstance(router_g.router, ReplicaGroupRouterConfig)
         assert router_g.router.type == RouterType.SMG
 
+    def test_service_rejects_gateway_registration_metadata(self):
+        with pytest.raises(ConfigurationError, match="inference_stack"):
+            parse_run_configuration(
+                {
+                    "type": "service",
+                    "port": 8000,
+                    "image": "custom",
+                    "inference_stack": {"router": {"name": "dynamo"}},
+                }
+            )
+        assert "inference_stack" not in ServiceConfiguration.model_json_schema()["properties"]
+
     def test_spot_policy_set_at_both_service_and_group_rejected(self):
         with pytest.raises(
             ConfigurationError,

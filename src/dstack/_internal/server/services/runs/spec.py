@@ -10,6 +10,7 @@ from dstack._internal.core.models.configurations import (
     ServiceConfiguration,
     TaskConfiguration,
 )
+from dstack._internal.core.models.inference_stack import InferenceStack
 from dstack._internal.core.models.profiles import ProfileRetry
 from dstack._internal.core.models.repos.virtual import DEFAULT_VIRTUAL_REPO_ID, VirtualRunRepoData
 from dstack._internal.core.models.resources import GPUSpec, ResourcesSpec
@@ -20,6 +21,7 @@ from dstack._internal.core.services.diff import ModelDiff, diff_models
 from dstack._internal.server import settings
 from dstack._internal.server.models import UserModel
 from dstack._internal.server.services.docker import is_valid_docker_volume_target
+from dstack._internal.server.services.inference_stack import infer_inference_stack
 from dstack._internal.server.services.resources import (
     set_default_gpu_spec,
     set_default_gpu_spec_vendor,
@@ -469,6 +471,13 @@ def _check_can_update_configuration(
                 "Cannot update router replica groups in-place (adding/removing `router` or changing "
                 "which replica group is the router is not supported). Stop the run and apply again."
             )
+        if current.model is not None and current.model.format == "openai":
+            current_stack = infer_inference_stack(current) or InferenceStack()
+            new_stack = infer_inference_stack(new) or InferenceStack()
+            if current_stack.parser_facts() != new_stack.parser_facts():
+                raise ServerClientError(
+                    "Changing the inference engine, router, processor or transport requires a replacement run."
+                )
     updatable_fields = _CONF_UPDATABLE_FIELDS + _TYPE_SPECIFIC_CONF_UPDATABLE_FIELDS.get(
         new.type, []
     )

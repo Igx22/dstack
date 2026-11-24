@@ -224,18 +224,13 @@ async def test_stream_disconnect(harness, after_usage, progressive):
     h = harness
     await h.backend_control(hold=["disconnect"], after_usage=after_usage)
     body = {
-        "model": "model-a",
+        "model": "model-progress" if progressive else "model-a",
         "user": "disconnect",
         "messages": [{"role": "user", "content": "A"}],
         "stream": True,
         "stream_options": {"include_usage": True},
     }
     async with httpx.AsyncClient(base_url=h.gateway_url, timeout=10) as client:
-        if progressive:
-            config = await client.post(
-                "/api/config", json={"usage_metering_profiles": {PAIR[1]: "dynamo-1.6.2-rust"}}
-            )
-            config.raise_for_status()
         async with client.stream(
             "POST",
             "/api/models/p/chat/completions",
@@ -275,7 +270,7 @@ async def test_stream_disconnect(harness, after_usage, progressive):
         try:
             receipt = await receiver.collect_once()
             assert receipt.acked_ids == [batch["batch_id"]]
-            assert receiver.totals() == {PAIR: wanted}
+            assert receiver.totals() == {(PAIR[0], "c" * 32): wanted}
             assert (await h.batches())["batches"] == []
         finally:
             await receiver.close()

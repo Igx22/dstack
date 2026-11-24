@@ -1,14 +1,15 @@
 import asyncio
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
-from pydantic import TypeAdapter
+from pydantic import Field, JsonValue, TypeAdapter
 
 from dstack._internal.core.consts import DSTACK_RUNNER_SSH_PORT
 from dstack._internal.core.errors import GatewayError
 from dstack._internal.core.models.common import validate_json_extra_ignore
 from dstack._internal.core.models.configurations import RateLimit, ServiceConfiguration
+from dstack._internal.core.models.inference_stack import InferenceStack
 from dstack._internal.core.models.instances import SSHConnectionParams
 from dstack._internal.core.models.runs import JobSpec, JobSubmission, get_service_port
 from dstack._internal.proxy.gateway.schemas.registry import (
@@ -18,13 +19,29 @@ from dstack._internal.proxy.gateway.schemas.registry import (
 from dstack._internal.proxy.gateway.schemas.services import ServiceListItem, ServiceListResponse
 from dstack._internal.proxy.gateway.schemas.stats import ServiceStats
 from dstack._internal.proxy.lib.schemas.usage import (
-    LegacyUsageBatchPage,
+    Identifier,
     UsageAckRequest,
     UsageAckResponse,
-    UsageBatchPage,
     UsageDrainResponse,
+    UsageModel,
 )
 from dstack._internal.server import settings
+
+
+class _ReceivedPage(UsageModel):
+    """Validate the envelope first so one invalid minute cannot hide its neighbors."""
+
+    batches: list[JsonValue] = Field(max_length=100)
+    has_more: bool = False
+
+
+class ReceivedUsagePage(_ReceivedPage):
+    schema_version: Literal[2] = 2
+
+
+class _LegacyReceivedUsagePage(_ReceivedPage):
+    schema_version: Literal[1] = 1
+    collector_id: Identifier
 
 
 class GatewayClient:
@@ -61,6 +78,7 @@ class GatewayClient:
         rate_limits: list[RateLimit],
         ssh_private_key: str,
         has_router_replica: bool = False,
+        inference_stack: Optional[InferenceStack] = None,
     ):
         if "openai" in options:
             entrypoint = f"gateway.{domain.split('.', maxsplit=1)[1]}"
@@ -79,6 +97,8 @@ class GatewayClient:
             "ssh_private_key": ssh_private_key,
             "has_router_replica": has_router_replica,
         }
+        if inference_stack is not None:
+            payload["inference_stack"] = inference_stack.model_dump(mode="json")
         resp = await self._client.post(
             self._url(f"/api/registry/{project}/services/register"), json=payload
         )
@@ -249,7 +269,7 @@ class GatewayClient:
             return []
         return TypeAdapter(list[ServiceStats]).validate_python(resp_data)
 
-    async def fetch_usage_batches(self, limit: int = 100) -> UsageBatchPage:
+    async def fetch_usage_batches(self, limit: int = 100) -> ReceivedUsagePage:
         if not 1 <= limit <= 100:
             raise ValueError("Usage page limit must be between 1 and 100")
         response = await self._client.get(
@@ -258,11 +278,9 @@ class GatewayClient:
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict) and payload.get("schema_version", 1) == 1:
-            legacy = LegacyUsageBatchPage.model_validate(payload)
-            return UsageBatchPage.model_validate(
-                legacy.model_dump(exclude={"schema_version", "collector_id"})
-            )
-        return UsageBatchPage.model_validate(payload)
+            legacy = _LegacyReceivedUsagePage.model_validate(payload)
+            return ReceivedUsagePage(batches=legacy.batches, has_more=legacy.has_more)
+        return ReceivedUsagePage.model_validate(payload)
 
     async def acknowledge_usage(self, batch_ids: list[str]) -> UsageAckResponse:
         payload = UsageAckRequest(batch_ids=batch_ids)

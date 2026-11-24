@@ -68,6 +68,7 @@ from dstack._internal.server.services.gateways.usage import (
     collect_gateway_usage,
     drain_gateway_usage,
 )
+from dstack._internal.server.services.inference_stack import infer_inference_stack
 from dstack._internal.server.services.instances import get_instance_remote_connection_info
 from dstack._internal.server.services.jobs import job_model_to_job_submission
 from dstack._internal.server.services.locking import get_locker
@@ -1396,6 +1397,7 @@ async def _register_service(
         rate_limits=run_spec.configuration.rate_limits,
         ssh_private_key=run_model.project.ssh_private_key,
         has_router_replica=has_replica_group_router,
+        inference_stack=infer_inference_stack(run_spec.configuration),
     )
 
 

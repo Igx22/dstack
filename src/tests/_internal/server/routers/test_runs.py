@@ -114,6 +114,25 @@ def get_submitted_run_spec_dict(run_spec: Dict) -> Dict:
     return run_spec
 
 
+def dynamo_service(processor: str, version: str) -> ServiceConfiguration:
+    return ServiceConfiguration.model_validate(
+        {
+            "port": 80,
+            "model": "chat",
+            "image": f"nvcr.io/nvidia/ai-dynamo/vllm-runtime:{version}",
+            "groups": [
+                {
+                    "name": "frontend",
+                    "replicas": 1,
+                    "router": {"type": "dynamo"},
+                    "commands": [f"python3 -m dynamo.frontend --dyn-chat-processor {processor}"],
+                },
+                {"name": "worker", "replicas": 1, "commands": ["python3 -m dynamo.vllm"]},
+            ],
+        }
+    )
+
+
 def get_dev_env_run_plan_dict(
     project_name: str = "test_project",
     username: str = "test_user",
@@ -3163,6 +3182,18 @@ class TestGetRunPlan:
                 ),
                 "update",
                 id="update-service",
+            ),
+            pytest.param(
+                dynamo_service("dynamo", "1.6.2"),
+                dynamo_service("vllm", "1.6.2"),
+                "create",
+                id="replace-service-on-dynamo-processor-change",
+            ),
+            pytest.param(
+                dynamo_service("vllm", "1.6.2"),
+                dynamo_service("vllm", "1.6.3"),
+                "update",
+                id="keep-service-on-dynamo-version-change",
             ),
             pytest.param(
                 ServiceConfiguration(

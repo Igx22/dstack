@@ -43,6 +43,7 @@ def make_backend() -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request):
+        assert "x-dstack-target-run" not in request.headers
         body = await request.json()
         request_id = body["user"]
         started.add(request_id)

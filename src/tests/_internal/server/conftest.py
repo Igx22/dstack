@@ -6,11 +6,12 @@ import gpuhunt
 import httpx
 import pytest
 
-from dstack._internal.proxy.lib.schemas.usage import UsageBatchPage, UsageDrainResponse
+from dstack._internal.proxy.lib.schemas.usage import UsageDrainResponse
 from dstack._internal.server.main import app
 from dstack._internal.server.services import encryption as encryption  # import for side-effect
 from dstack._internal.server.services import logs as logs_services
 from dstack._internal.server.services.docker import ImageConfig, ImageConfigObject
+from dstack._internal.server.services.gateways.client import ReceivedUsagePage
 from dstack._internal.server.services.logs.filelog import FileLogStorage
 from dstack._internal.server.testing.conf import (  # noqa: F401
     postgres_container,
@@ -66,6 +67,6 @@ def mock_gateway_connection() -> Generator[AsyncMock, None, None]:
         get_conn_mock.return_value.client = Mock()
         get_conn_mock.return_value.client.return_value = AsyncMock()
         client = get_conn_mock.return_value.client.return_value.__aenter__.return_value
-        client.fetch_usage_batches.return_value = UsageBatchPage(batches=[])
+        client.fetch_usage_batches.return_value = ReceivedUsagePage(batches=[])
         client.drain_usage.return_value = UsageDrainResponse(sealed=True, empty=True)
         yield get_conn_mock

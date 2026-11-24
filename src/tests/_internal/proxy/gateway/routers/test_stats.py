@@ -5,9 +5,10 @@ import httpx
 import pytest
 
 from dstack._internal.proxy.gateway.app import make_app
+from dstack._internal.proxy.gateway.models import GatewayService
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
-from dstack._internal.proxy.lib.models import Service
-from dstack._internal.proxy.lib.testing.common import make_project, make_service
+from dstack._internal.proxy.lib.testing.common import make_project
+from tests._internal.proxy.gateway.common import make_service
 
 
 def make_client(repo: GatewayProxyRepo) -> httpx.AsyncClient:
@@ -129,7 +130,9 @@ def make_client(repo: GatewayProxyRepo) -> httpx.AsyncClient:
         ),
     ],
 )
-async def test_collect_stats(services: Iterable[Service], collector_stats, expected_response):
+async def test_collect_stats(
+    services: Iterable[GatewayService], collector_stats, expected_response
+):
     repo = GatewayProxyRepo()
     for service in services:
         await repo.set_project(make_project(service.project_name))

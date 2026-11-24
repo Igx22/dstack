@@ -22,6 +22,13 @@ class BaseProxyRepo(ABC):
     async def get_model(self, project_name: str, name: str) -> Optional[ChatModel]:
         pass
 
+    async def get_model_and_service(
+        self, project_name: str, name: str
+    ) -> tuple[Optional[ChatModel], Optional[Service]]:
+        model = await self.get_model(project_name, name)
+        service = await self.get_service(project_name, model.run_name) if model else None
+        return model, service
+
     @abstractmethod
     async def get_project(self, name: str) -> Optional[Project]:
         pass

@@ -15,6 +15,14 @@ server {
     server_name {{ domain }};
     limit_req_status 429;
     set $dstack_replica_hit 0;
+    # A loopback model request can outlive the registration it selected for this hostname.
+    set $dstack_target_run $http_x_dstack_target_run;
+    if ($remote_addr != 127.0.0.1) {
+        set $dstack_target_run "";
+    }
+    if ($dstack_target_run !~ "^({{ route_key }})?$") {
+        return 503;
+    }
     access_log {{ access_log_path }} dstack_stat;
     client_max_body_size {{ client_max_body_size }};
 
@@ -63,6 +71,7 @@ server {
         add_header 'Access-Control-Allow-Headers' '*' always;
         {% endif %}
         proxy_pass http://{{ domain }}.upstream;
+        proxy_set_header X-Dstack-Target-Run "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header Host $host;
         proxy_http_version 1.1;
@@ -86,6 +95,7 @@ server {
         add_header 'Access-Control-Allow-Headers' '*' always;
         {% endif %}
         proxy_pass http://{{ domain }}.upstream;
+        proxy_set_header X-Dstack-Target-Run "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header Host $host;
         proxy_read_timeout {{ read_timeout }}s;

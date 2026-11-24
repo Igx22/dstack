@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from functools import cached_property
-from typing import Annotated, Any, Iterable, Literal, Optional, Union
+from typing import Annotated, Any, Iterable, Literal, Optional, Self, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -98,11 +98,11 @@ class Service(ImmutableModel):
             raise UnexpectedProxyError(f"https unexpectedly missing for service {self.fmt()}")
         return self.https
 
-    def with_replicas(self, new_replicas: Iterable[Replica]) -> "Service":
-        return Service(**{**self.model_dump(), "replicas": tuple(new_replicas)})
+    def with_replicas(self, new_replicas: Iterable[Replica]) -> Self:
+        return self.model_copy(update={"replicas": tuple(new_replicas)})
 
-    def with_id(self, new_id: str) -> "Service":
-        return Service(**{**self.model_dump(), "id": new_id})
+    def with_id(self, new_id: str) -> Self:
+        return self.model_copy(update={"id": new_id})
 
     def find_replica(self, replica_id: str) -> Optional[Replica]:
         for replica in self.replicas:

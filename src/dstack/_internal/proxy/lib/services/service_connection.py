@@ -288,14 +288,6 @@ async def get_service_replica_client(
     """
     `service` must have at least one replica
     """
-    if service.domain is not None:
-        # Forward to Nginx so that requests are visible to StatsCollector in the access log
-        return httpx.AsyncClient(
-            base_url="http://127.0.0.1",
-            headers={"Host": service.domain},
-            timeout=service.read_timeout,
-        )
-    # Nginx not available, forward directly to the tunnel
     replica = random.choice(service.replicas)
     connection = await service_conn_pool.get(replica.id)
     if connection is None or replica.ssh_head_proxy is not None:

@@ -7,7 +7,7 @@ from dstack._internal.proxy.lib.schemas.model_proxy import (
     PromptTokensDetails,
 )
 from dstack._internal.proxy.lib.schemas.usage import TokenUsage
-from dstack._internal.proxy.lib.services.usage import VLLM_PROFILE, UsageAttempt, normalize_usage
+from dstack._internal.proxy.lib.services.usage import UsageAttempt, UsageRule, normalize_usage
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -18,8 +18,8 @@ class StreamUsage:
     def __init__(self, attempt: UsageAttempt, n: int):
         self._attempt = attempt
         self._n = n
-        self._per_choice = attempt.profile == "vllm-0.19.1-per-choice"
-        self.request_progress = attempt.profile != VLLM_PROFILE
+        self._per_choice = attempt.rule is UsageRule.PER_CHOICE
+        self.request_progress = attempt.rule is not UsageRule.FINAL_ONLY
         self._final = False
         self._finished_choices: set[int] = set()
         self._finish_usage: dict[int, TokenUsage] = {}
@@ -33,7 +33,7 @@ class StreamUsage:
     def observe(self, chunk: ChatCompletionsChunk, raw_usage: Any) -> ChatCompletionsChunk | None:
         if self._final:
             return None
-        usage = normalize_usage(raw_usage, self._attempt.profile)
+        usage = normalize_usage(raw_usage)
         if not chunk.choices:
             if usage is None:
                 return None
@@ -102,7 +102,7 @@ class StreamUsage:
 
         key = next(iter(indices)) if self._per_choice else 0
         previous = self._outputs.get(key, 0)
-        has_cache = raw_usage.get("prompt_tokens_details") is not None
+        has_cache = (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens") is not None
         if (
             usage.completion_tokens < previous
             or usage.prompt_tokens < self._prompt
@@ -136,6 +136,9 @@ class StreamUsage:
 
         for index in finishes:
             self._finish_usage.setdefault(index, usage)
+        # This rule's choice counts remain provisional until a separate final usage event.
+        if self._attempt.rule is UsageRule.REQUEST_WIDE:
+            return
         if self._per_choice:
             complete = bool(finishes) and len(self._finish_usage) == self._n
         else:

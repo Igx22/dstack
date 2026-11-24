@@ -7,8 +7,9 @@ import pytest
 from dstack._internal.proxy.gateway.app import make_app
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.lib.models import Replica
-from dstack._internal.proxy.lib.testing.common import make_project, make_service
+from dstack._internal.proxy.lib.testing.common import make_project
 from dstack._internal.utils import ssh as ssh_utils
+from tests._internal.proxy.gateway.common import make_service
 
 
 def make_client(repo: GatewayProxyRepo) -> httpx.AsyncClient:

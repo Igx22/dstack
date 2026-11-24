@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 import dstack._internal.proxy.gateway.services.registry as registry_services
-from dstack._internal.proxy.gateway.deps import get_gateway_proxy_repo, get_nginx
+from dstack._internal.proxy.gateway.deps import get_gateway_proxy_repo, get_metering, get_nginx
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.schemas.common import OkResponse
 from dstack._internal.proxy.gateway.schemas.registry import (
@@ -14,6 +14,7 @@ from dstack._internal.proxy.gateway.schemas.registry import (
     UpdateReplicaProxyJumpKeysRequest,
     UpdateReplicaProxyJumpKeysResponse,
 )
+from dstack._internal.proxy.gateway.services.metering import MeteringCollector
 from dstack._internal.proxy.gateway.services.nginx import Nginx
 from dstack._internal.proxy.lib.deps import get_service_connection_pool
 from dstack._internal.proxy.lib.services.service_connection import ServiceConnectionPool
@@ -25,10 +26,14 @@ router = APIRouter()
 async def register_service(
     project_name: str,
     body: RegisterServiceRequest,
+    metering: Annotated[MeteringCollector, Depends(get_metering)],
     repo: Annotated[GatewayProxyRepo, Depends(get_gateway_proxy_repo)],
     nginx: Annotated[Nginx, Depends(get_nginx)],
     service_conn_pool: Annotated[ServiceConnectionPool, Depends(get_service_connection_pool)],
 ) -> OkResponse:
+    model = body.options.openai.model if body.options.openai is not None else None
+    if model is not None and model.format == "openai":
+        await metering.start()
     await registry_services.register_service(
         project_name=project_name.lower(),
         run_id=body.id,
@@ -39,10 +44,11 @@ async def register_service(
         auth=body.auth,
         client_max_body_size=body.client_max_body_size,
         read_timeout=body.read_timeout,
-        model=body.options.openai.model if body.options.openai is not None else None,
+        model=model,
         ssh_private_key=body.ssh_private_key,
         repo=repo,
         has_router_replica=body.has_router_replica,
+        inference_stack=body.inference_stack,
         nginx=nginx,
         service_conn_pool=service_conn_pool,
     )

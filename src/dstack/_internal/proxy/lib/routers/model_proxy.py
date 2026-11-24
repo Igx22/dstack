@@ -13,7 +13,6 @@ from dstack._internal.proxy.lib.deps import (
     ProxyDependencyInjector,
     get_injector,
     get_proxy_repo,
-    get_service_connection_pool,
 )
 from dstack._internal.proxy.lib.errors import ProxyError, UnexpectedProxyError
 from dstack._internal.proxy.lib.repo import BaseProxyRepo
@@ -26,10 +25,6 @@ from dstack._internal.proxy.lib.schemas.model_proxy import (
 )
 from dstack._internal.proxy.lib.schemas.usage import UsageKey
 from dstack._internal.proxy.lib.services.model_proxy.model_proxy import get_chat_client
-from dstack._internal.proxy.lib.services.service_connection import (
-    ServiceConnectionPool,
-    get_service_replica_client,
-)
 from dstack._internal.proxy.lib.services.usage import UsageAttempt
 
 _model_auth = ProxyAuth(auto_enforce=True)
@@ -53,35 +48,32 @@ async def post_chat_completions(
     project_name: str,
     body: ChatCompletionsRequest,
     repo: Annotated[BaseProxyRepo, Depends(get_proxy_repo)],
-    service_conn_pool: Annotated[ServiceConnectionPool, Depends(get_service_connection_pool)],
     auth: Annotated[ProxyAuthContext, Depends(_model_auth)],
     injector: Annotated[ProxyDependencyInjector, Depends(get_injector)],
 ):
-    model = await repo.get_model(project_name, body.model)
+    model, service = await repo.get_model_and_service(project_name, body.model)
     if model is None:
         raise ProxyError(
             f"Model {body.model} not found in project {project_name}", status.HTTP_404_NOT_FOUND
         )
-    service = await repo.get_service(project_name, model.run_name)
     if service is None or not service.replicas:
         raise UnexpectedProxyError(
             f"Model {model.name} in project {project_name} references run {model.run_name}"
             " that does not exist or has no replicas"
         )
     observer = injector.get_usage_observer()
-    profile = observer.profile_for(service.id)
     attempt = None
-    if profile is not None:
-        if service.id is None or model.format_spec.format != "openai":
+    if observer is not None and model.format_spec.format == "openai":
+        if service.id is None:
             raise ProxyError("Metering requires a registered OpenAI service", 503)
         subject = await auth.require_subject()
-        attempt = observer.start_attempt(
+        attempt = observer.start_service_attempt(
+            service,
             UsageKey(consumer_subject_id=subject.consumer_subject_id, service_id=service.id),
-            profile,
         )
     transferred = False
     try:
-        http_client = await get_service_replica_client(service, repo, service_conn_pool)
+        http_client = await injector.get_service_replica_client(service, repo)
         client = get_chat_client(model, http_client)
         if not body.stream:
             if attempt is None:

@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncIterator, Generator
 from unittest.mock import patch
@@ -26,8 +27,8 @@ from dstack._internal.proxy.lib.testing.auth import ProxyTestAuthProvider
 from dstack._internal.proxy.lib.testing.common import (
     ProxyTestDependencyInjector,
     make_project,
-    make_service,
 )
+from tests._internal.proxy.gateway.common import make_service
 
 SAMPLE_RESPONSE = "Hello there, how may I assist you today?"
 
@@ -181,6 +182,44 @@ async def test_chat_completions(mock_chat_client) -> None:
         messages=[{"role": "user", "content": "Hi"}],
     )
     assert completion.choices[0].message.content == SAMPLE_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_resolves_one_registration(monkeypatch):
+    repo = GatewayProxyRepo()
+    old_model = make_model("project", "model", "run")
+    old_service = make_service("project", "run", run_id="old")
+    replacement_model = old_model.model_copy(
+        update={"format_spec": OpenAIChatModelFormat(prefix="/v2")}
+    )
+    await repo.set_service(old_service)
+    await repo.set_model(old_model)
+    reader = repo.reader
+
+    @asynccontextmanager
+    async def replace_after_first_read():
+        async with reader():
+            yield
+        monkeypatch.setattr(repo, "reader", reader)
+        await repo.delete_models_by_run("project", "run")
+        await repo.delete_service("project", "run")
+        await repo.set_service(make_service("project", "run", run_id="replacement"))
+        await repo.set_model(replacement_model)
+
+    monkeypatch.setattr(repo, "reader", replace_after_first_read)
+    with (
+        patch.object(ProxyTestDependencyInjector, "get_service_replica_client") as dispatch,
+        patch(
+            "dstack._internal.proxy.lib.routers.model_proxy.get_chat_client",
+            return_value=ChatClientStub(),
+        ) as adapter,
+    ):
+        client = make_openai_client(repo, ProxyTestAuthProvider({"project": {"token"}}), "project")
+        await client.chat.completions.create(
+            model="model", messages=[{"role": "user", "content": "Hi"}]
+        )
+        assert adapter.call_args.args[0] is old_model
+        assert dispatch.call_args.args[0] is old_service
 
 
 @pytest.mark.asyncio

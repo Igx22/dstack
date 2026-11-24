@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import dstack._internal.proxy.gateway.schemas.registry as schemas
+from dstack._internal.core.models.inference_stack import InferenceStack
 from dstack._internal.core.models.instances import SSHConnectionParams
 from dstack._internal.proxy.gateway import models as gateway_models
 from dstack._internal.proxy.gateway.const import SERVICE_ALREADY_REGISTERED_ERROR_TEMPLATE
@@ -49,9 +50,10 @@ async def register_service(
     nginx: Nginx,
     service_conn_pool: ServiceConnectionPool,
     has_router_replica: bool = False,
+    inference_stack: Optional[InferenceStack] = None,
 ) -> None:
     cors_enabled = model is not None and model.type == "chat" and model.format == "openai"
-    service = models.Service(
+    service = gateway_models.GatewayService(
         id=run_id,
         project_name=project_name,
         run_name=run_name,
@@ -62,6 +64,7 @@ async def register_service(
         client_max_body_size=client_max_body_size,
         replicas=(),
         has_router_replica=has_router_replica,
+        inference_stack=inference_stack,
         cors_enabled=cors_enabled,
         proxy_buffering=model is None,
         read_timeout=read_timeout,
@@ -340,8 +343,8 @@ async def register_model_entrypoint(
 
 
 async def apply_service(
-    service: models.Service,
-    old_service: Optional[models.Service],
+    service: gateway_models.GatewayService,
+    old_service: Optional[gateway_models.GatewayService],
     repo: GatewayProxyRepo,
     nginx: Nginx,
     service_conn_pool: ServiceConnectionPool,
@@ -423,7 +426,7 @@ async def stop_replica_connections(
 
 
 async def get_nginx_service_config(
-    service: models.Service, replicas: Iterable[ReplicaConfig]
+    service: gateway_models.GatewayService, replicas: Iterable[ReplicaConfig]
 ) -> ServiceConfig:
     limit_req_zones: list[LimitReqZoneConfig] = []
     locations: list[LocationConfig] = []
@@ -480,6 +483,7 @@ async def get_nginx_service_config(
         locations.append(LocationConfig(prefix="/", limit_req=None))
     return ServiceConfig(
         domain=service.domain_safe,
+        route_key=service.nginx_route_key,
         https=service.https_safe,
         project_name=service.project_name,
         auth=service.auth,
@@ -528,7 +532,7 @@ async def _migrate_cors_enabled(repo: GatewayProxyRepo) -> None:
             not service.cors_enabled
             and (service.project_name, service.run_name) in openai_run_names
         ):
-            updated = models.Service(**{**service.model_dump(), "cors_enabled": True})
+            updated = service.model_copy(update={"cors_enabled": True})
             await repo.set_service(updated)
 
 

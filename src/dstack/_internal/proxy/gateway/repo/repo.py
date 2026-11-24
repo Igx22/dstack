@@ -7,14 +7,18 @@ from typing import Iterable, Optional
 from aiorwlock import RWLock
 from pydantic import BaseModel
 
-from dstack._internal.proxy.gateway.models import GlobalProxyConfig, ModelEntrypoint
-from dstack._internal.proxy.lib.models import ChatModel, Project, Service
+from dstack._internal.proxy.gateway.models import (
+    GatewayService,
+    GlobalProxyConfig,
+    ModelEntrypoint,
+)
+from dstack._internal.proxy.lib.models import ChatModel, Project
 from dstack._internal.proxy.lib.repo import BaseProxyRepo
 from dstack._internal.utils.common import run_async
 
 
 class State(BaseModel):
-    services: dict[str, dict[str, Service]] = {}
+    services: dict[str, dict[str, GatewayService]] = {}
     models: dict[str, dict[str, ChatModel]] = {}
     entrypoints: dict[str, ModelEntrypoint] = {}
     projects: dict[str, Project] = {}
@@ -31,18 +35,18 @@ class GatewayProxyRepo(BaseProxyRepo):
         self._file = file
         self._lock = RWLock()
 
-    async def list_services(self) -> list[Service]:
+    async def list_services(self) -> list[GatewayService]:
         async with self.reader():
             services_by_project = (
                 project_services.values() for project_services in self._state.services.values()
             )
             return list(chain(*services_by_project))
 
-    async def get_service(self, project_name: str, run_name: str) -> Optional[Service]:
+    async def get_service(self, project_name: str, run_name: str) -> Optional[GatewayService]:
         async with self.reader():
             return self._state.services.get(project_name, {}).get(run_name)
 
-    async def get_service_by_domain(self, domain: str) -> Optional[Service]:
+    async def get_service_by_domain(self, domain: str) -> Optional[GatewayService]:
         async with self.reader():
             for project_services in self._state.services.values():
                 for service in project_services.values():
@@ -50,11 +54,11 @@ class GatewayProxyRepo(BaseProxyRepo):
                         return service
             return None
 
-    async def set_service(self, service: Service) -> None:
+    async def set_service(self, service: GatewayService) -> None:
         async with self.writer():
             self._state.services.setdefault(service.project_name, {})[service.run_name] = service
 
-    async def set_services(self, services: Iterable[Service]) -> None:
+    async def set_services(self, services: Iterable[GatewayService]) -> None:
         """Save a batch before publishing it, so failed saves remain retryable."""
         async with self._lock.writer:
             services_by_project = {
@@ -79,9 +83,27 @@ class GatewayProxyRepo(BaseProxyRepo):
         async with self.reader():
             return list(self._state.models.get(project_name, {}).values())
 
+    async def has_openai_models(self) -> bool:
+        async with self.reader():
+            return any(
+                model.format_spec.format == "openai"
+                for project_models in self._state.models.values()
+                for model in project_models.values()
+            )
+
     async def get_model(self, project_name: str, name: str) -> Optional[ChatModel]:
         async with self.reader():
             return self._state.models.get(project_name, {}).get(name)
+
+    async def get_model_and_service(
+        self, project_name: str, name: str
+    ) -> tuple[Optional[ChatModel], Optional[GatewayService]]:
+        # A replacement can reuse both names with a different model format and run UUID.
+        async with self.reader():
+            model = self._state.models.get(project_name, {}).get(name)
+            if model is None:
+                return None, None
+            return model, self._state.services.get(project_name, {}).get(model.run_name)
 
     async def set_model(self, model: ChatModel) -> None:
         async with self.writer():

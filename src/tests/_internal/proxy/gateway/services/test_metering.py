@@ -7,7 +7,7 @@ from dstack._internal.proxy.gateway.services.metering import Clock, MeteringColl
 from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
 from dstack._internal.proxy.lib.errors import ProxyError
 from dstack._internal.proxy.lib.schemas.usage import UsageKey
-from dstack._internal.proxy.lib.services.usage import VLLM_PROFILE
+from dstack._internal.proxy.lib.services.usage import UsageRule
 
 
 class FakeClock(Clock):
@@ -32,7 +32,7 @@ class FailingStore(MeteringStore):
 
 async def record(collector, user="u", service="s", usage=None):
     attempt = collector.start_attempt(
-        UsageKey(consumer_subject_id=user, service_id=service), VLLM_PROFILE
+        UsageKey(consumer_subject_id=user, service_id=service), UsageRule.FINAL_ONLY
     )
     attempt.mark_dispatched()
     attempt.observe_usage(
@@ -50,11 +50,24 @@ async def record(collector, user="u", service="s", usage=None):
 
 @pytest.mark.asyncio
 class TestMeteringCollector:
+    async def test_start_retries_failed_initial_checkpoint(self, tmp_path):
+        store = FailingStore(tmp_path / "usage.json")
+        collector = MeteringCollector(store, clock=FakeClock())
+        store.fail = True
+        with pytest.raises(OSError):
+            await collector.start()
+        with pytest.raises(ProxyError):
+            await record(collector)
+        store.fail = False
+        await collector.start()
+        await record(collector)
+        await collector.close()
+
     async def test_drain_finishes_admitted_attempts_and_replays_final_minute(self, tmp_path):
         path = tmp_path / "usage.json"
         clock = FakeClock()
         store = MeteringStore(path)
-        c = MeteringCollector(store, clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=clock)
         await c.start()
         try:
             await record(c)
@@ -65,11 +78,11 @@ class TestMeteringCollector:
             assert saved is not None
             final_minute = saved.active_batch
             key = UsageKey(consumer_subject_id="u", service_id="s")
-            attempt = c.start_attempt(key, VLLM_PROFILE)
+            attempt = c.start_attempt(key, UsageRule.FINAL_ONLY)
             attempt.mark_dispatched()
             assert (await c.drain()).model_dump() == {"sealed": False, "empty": False}
             with pytest.raises(ProxyError) as exc:
-                c.start_attempt(key, VLLM_PROFILE)
+                c.start_attempt(key, UsageRule.FINAL_ONLY)
             assert exc.value.status_code == 503
             await c.acknowledge([previous.batch_id])
             assert not (await c.drain()).empty
@@ -87,14 +100,14 @@ class TestMeteringCollector:
             await c.close()
 
         # Restart within the sealed UTC minute. Old ACKs cannot remove the final batch.
-        c = MeteringCollector(MeteringStore(path), clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(MeteringStore(path), clock=clock)
         await c.start()
         try:
             await c.rotate_if_due()
             await c.acknowledge([previous.batch_id])
             assert (await c.get_batches()).batches == [batch]
             with pytest.raises(ProxyError):
-                c.start_attempt(key, VLLM_PROFILE)
+                c.start_attempt(key, UsageRule.FINAL_ONLY)
             await c.acknowledge([batch.batch_id])
             assert (await c.drain()).model_dump() == {"sealed": True, "empty": True}
         finally:
@@ -103,7 +116,7 @@ class TestMeteringCollector:
     async def test_drain_fails_closed_across_disk_failure_and_ack_retry(self, tmp_path):
         path = tmp_path / "usage.json"
         store = FailingStore(path)
-        c = MeteringCollector(store, clock=FakeClock(), profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=FakeClock())
         await c.start()
         try:
             await record(c)
@@ -134,29 +147,29 @@ class TestMeteringCollector:
         path = tmp_path / "usage.json"
         clock = FakeClock()
         store = MeteringStore(path)
-        c = MeteringCollector(store, clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=clock)
         await c.start()
         key = UsageKey(consumer_subject_id="u", service_id="s")
-        c.start_attempt(key, VLLM_PROFILE).mark_dispatched()
+        c.start_attempt(key, UsageRule.FINAL_ONLY).mark_dispatched()
         assert not (await c.drain()).sealed
         # Abrupt loss of the process, without graceful request finalization.
         store.close()
         for _ in range(2):
-            c = MeteringCollector(MeteringStore(path), clock=clock, profiles={"s": VLLM_PROFILE})
+            c = MeteringCollector(MeteringStore(path), clock=clock)
             await c.start()
             try:
                 with pytest.raises(ProxyError) as exc:
                     await c.drain()
                 assert exc.value.status_code == 503
                 with pytest.raises(ProxyError):
-                    c.start_attempt(key, VLLM_PROFILE)
+                    c.start_attempt(key, UsageRule.FINAL_ONLY)
             finally:
                 await c.close()
 
     async def test_cancelled_drain_persists_final_batch_before_unlock(self, tmp_path, monkeypatch):
         clock = FakeClock()
         store = MeteringStore(tmp_path / "usage.json")
-        c = MeteringCollector(store, clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=clock)
         await c.start()
         await record(c)
         writing, release = asyncio.Event(), asyncio.Event()
@@ -191,7 +204,7 @@ class TestMeteringCollector:
 
     async def test_interrupted_checkpoint_cannot_certify_a_seal(self, tmp_path, monkeypatch):
         store = MeteringStore(tmp_path / "usage.json")
-        c = MeteringCollector(store, clock=FakeClock(), profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=FakeClock())
         await c.start()
         try:
             await record(c)
@@ -214,9 +227,7 @@ class TestMeteringCollector:
 
     async def test_ack_does_not_clear_active(self, tmp_path):
         clock = FakeClock()
-        collector = MeteringCollector(
-            MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-        )
+        collector = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
         await collector.start()
         await record(collector)
         assert not (await collector.get_batches()).batches
@@ -238,7 +249,7 @@ class TestMeteringCollector:
         self, tmp_path, monkeypatch
     ):
         store = MeteringStore(tmp_path / "usage.json")
-        c = MeteringCollector(store, clock=FakeClock(), profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=FakeClock())
         await c.start()
         try:
             await record(c)
@@ -268,9 +279,7 @@ class TestMeteringCollector:
 
     async def test_ack_preserves_other_pending(self, tmp_path):
         clock = FakeClock()
-        c = MeteringCollector(
-            MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-        )
+        c = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
         await c.start()
         for _ in range(2):
             await record(c)
@@ -288,7 +297,7 @@ class TestMeteringCollector:
     async def test_rotation_not_published_before_save(self, tmp_path):
         clock = FakeClock()
         store = FailingStore(tmp_path / "usage.json")
-        c = MeteringCollector(store, clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=clock)
         await c.start()
         late = await record(c)
         store.fail = True
@@ -297,7 +306,9 @@ class TestMeteringCollector:
             await c.rotate_if_due()
         assert not (await c.get_batches()).batches
         with pytest.raises(ProxyError):
-            c.start_attempt(UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE)
+            c.start_attempt(
+                UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
+            )
         store.fail = False
         await c.checkpoint()
         assert (await c.get_batches()).batches[0].entries[0].total_tokens == 23
@@ -307,7 +318,7 @@ class TestMeteringCollector:
     async def test_failed_ack_is_not_success(self, tmp_path):
         clock = FakeClock()
         store = FailingStore(tmp_path / "usage.json")
-        c = MeteringCollector(store, clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=clock)
         await c.start()
         await record(c)
         clock.advance()
@@ -328,11 +339,11 @@ class TestMeteringCollector:
 
     async def test_late_finish_and_repeated_cleanup_count_once(self, tmp_path):
         clock = FakeClock()
-        c = MeteringCollector(
-            MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-        )
+        c = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
         await c.start()
-        a = c.start_attempt(UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE)
+        a = c.start_attempt(
+            UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
+        )
         a.mark_dispatched()
         a.observe_usage(dict(prompt_tokens=20, completion_tokens=3, total_tokens=23))
         clock.advance(130)
@@ -348,14 +359,12 @@ class TestMeteringCollector:
 
     async def test_unknown_only_after_dispatch(self, tmp_path):
         clock = FakeClock()
-        c = MeteringCollector(
-            MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-        )
+        c = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
         await c.start()
         key = UsageKey(consumer_subject_id="u", service_id="s")
-        a = c.start_attempt(key, VLLM_PROFILE)
+        a = c.start_attempt(key, UsageRule.FINAL_ONLY)
         await a.finish()
-        b = c.start_attempt(key, VLLM_PROFILE)
+        b = c.start_attempt(key, UsageRule.FINAL_ONLY)
         b.mark_dispatched()
         await b.finish()
         await b.finish()
@@ -368,22 +377,22 @@ class TestMeteringCollector:
 
     async def test_backward_clock_pauses_admission(self, tmp_path):
         clock = FakeClock()
-        c = MeteringCollector(
-            MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-        )
+        c = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
         await c.start()
         await record(c)
         clock.advance(-1)
         with pytest.raises(ProxyError):
             await c.rotate_if_due()
         with pytest.raises(ProxyError):
-            c.start_attempt(UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE)
+            c.start_attempt(
+                UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
+            )
         await c.close()
 
     async def test_active_ack_rejected_atomically(self, tmp_path):
         clock = FakeClock()
         store = MeteringStore(tmp_path / "usage.json")
-        c = MeteringCollector(store, clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(store, clock=clock)
         await c.start()
         await record(c)
         clock.advance()
@@ -401,7 +410,6 @@ class TestMeteringCollector:
         c = MeteringCollector(
             MeteringStore(tmp_path / "usage.json"),
             clock=clock,
-            profiles={"s": VLLM_PROFILE},
             max_pending=32,
             max_entries=1,
         )
@@ -409,7 +417,7 @@ class TestMeteringCollector:
         await asyncio.gather(*(record(c) for _ in range(20)))
         with pytest.raises(ProxyError):
             c.start_attempt(
-                UsageKey(consumer_subject_id="different", service_id="s"), VLLM_PROFILE
+                UsageKey(consumer_subject_id="different", service_id="s"), UsageRule.FINAL_ONLY
             )
         clock.advance()
         await c.rotate_if_due()
@@ -425,7 +433,7 @@ class TestMeteringCollector:
     async def test_old_checkpoint_cannot_resurrect_acked_batch(self, tmp_path):
         clock = FakeClock()
         path = tmp_path / "usage.json"
-        c = MeteringCollector(MeteringStore(path), clock=clock, profiles={"s": VLLM_PROFILE})
+        c = MeteringCollector(MeteringStore(path), clock=clock)
         await c.start()
         await record(c)
         clock.advance()
@@ -442,12 +450,10 @@ class TestMeteringCollector:
 @pytest.mark.asyncio
 async def test_repeated_cancellation_does_not_abandon_finalization(tmp_path):
     clock = FakeClock()
-    collector = MeteringCollector(
-        MeteringStore(tmp_path / "usage.json"), clock=clock, profiles={"s": VLLM_PROFILE}
-    )
+    collector = MeteringCollector(MeteringStore(tmp_path / "usage.json"), clock=clock)
     await collector.start()
     attempt = collector.start_attempt(
-        UsageKey(consumer_subject_id="u", service_id="s"), VLLM_PROFILE
+        UsageKey(consumer_subject_id="u", service_id="s"), UsageRule.FINAL_ONLY
     )
     attempt.mark_dispatched()
     attempt.observe_usage(dict(prompt_tokens=20, completion_tokens=3, total_tokens=23))

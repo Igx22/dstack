@@ -65,6 +65,7 @@ class LocationConfig(BaseModel):
 
 class ServiceConfig(SiteConfig):
     type: Literal["service"] = "service"
+    route_key: str
     project_name: str
     auth: bool
     client_max_body_size: int

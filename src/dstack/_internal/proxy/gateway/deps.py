@@ -1,8 +1,10 @@
 import asyncio
 from typing import Annotated, AsyncGenerator
 
+import httpx
 from fastapi import Depends, FastAPI, Request
 
+from dstack._internal.proxy.gateway.models import GatewayService
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.services.metering import MeteringCollector
 from dstack._internal.proxy.gateway.services.nginx import Nginx
@@ -14,6 +16,7 @@ from dstack._internal.proxy.lib.deps import (
     get_proxy_repo,
 )
 from dstack._internal.proxy.lib.errors import UnexpectedProxyError
+from dstack._internal.proxy.lib.models import Service
 from dstack._internal.proxy.lib.repo import BaseProxyRepo
 
 
@@ -24,7 +27,7 @@ class GatewayDependencyInjector(ProxyDependencyInjector):
         auth: BaseProxyAuthProvider,
         nginx: Nginx,
         stats_collector: StatsCollector,
-        metering: MeteringCollector | None = None,
+        metering: MeteringCollector,
     ) -> None:
         super().__init__()
         self._repo = repo
@@ -40,12 +43,24 @@ class GatewayDependencyInjector(ProxyDependencyInjector):
     async def get_auth_provider(self) -> AsyncGenerator[BaseProxyAuthProvider, None]:
         yield self._auth
 
-    def get_usage_observer(self):
-        return self._metering or super().get_usage_observer()
+    async def get_service_replica_client(
+        self, service: Service, repo: BaseProxyRepo
+    ) -> httpx.AsyncClient:
+        if service.domain is None:
+            return await super().get_service_replica_client(service, repo)
+        if not isinstance(service, GatewayService):
+            raise UnexpectedProxyError("Expected a registered Gateway service for Nginx routing")
+        # Route through Nginx so the request is included in service stats.
+        return httpx.AsyncClient(
+            base_url="http://127.0.0.1",
+            headers={"Host": service.domain, "X-Dstack-Target-Run": service.nginx_route_key},
+            timeout=service.read_timeout,
+        )
+
+    def get_usage_observer(self) -> MeteringCollector:
+        return self._metering
 
     def get_metering(self) -> MeteringCollector:
-        if self._metering is None:
-            raise UnexpectedProxyError("Gateway metering dependency is missing")
         return self._metering
 
     def get_nginx(self) -> Nginx:

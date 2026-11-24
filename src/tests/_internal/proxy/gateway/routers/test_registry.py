@@ -11,21 +11,30 @@ import pytest
 import time_machine
 
 from dstack._internal.core.errors import SSHError
+from dstack._internal.core.models.inference_stack import InferenceStack
 from dstack._internal.core.models.instances import SSHConnectionParams
 from dstack._internal.proxy.gateway.app import make_app
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
+from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
 from dstack._internal.proxy.gateway.services.nginx import Nginx
 from dstack._internal.proxy.gateway.testing.common import Mocks
 from dstack._internal.proxy.lib.models import ChatModel, OpenAIChatModelFormat
 from dstack._internal.proxy.lib.services.service_connection import ServiceConnection
-from dstack._internal.proxy.lib.testing.common import make_project, make_service
+from dstack._internal.proxy.lib.services.usage import UsageRule
+from dstack._internal.proxy.lib.testing.common import make_project
+from dstack._internal.server.services.gateways.client import GatewayClient
 from dstack._internal.server.testing.common import get_ssh_key
+from tests._internal.proxy.gateway.common import make_service
 from tests._internal.utils.test_ssh import PRIVATE_KEY, PUBLIC_KEY
 
 
 def make_client(nginx_dir: Path, repo: Optional[GatewayProxyRepo] = None) -> httpx.AsyncClient:
     (nginx_dir / "sites-enabled").mkdir(exist_ok=True)
-    app = make_app(repo=repo or GatewayProxyRepo(), nginx=Nginx(nginx_dir=nginx_dir))
+    app = make_app(
+        repo=repo or GatewayProxyRepo(),
+        nginx=Nginx(nginx_dir=nginx_dir),
+        metering_store=MeteringStore(nginx_dir / "usage.json"),
+    )
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test/")
 
 
@@ -270,6 +279,66 @@ class TestUpdateReplicaProxyJumpKeys:
 
 @pytest.mark.asyncio
 class TestRegisterService:
+    @pytest.mark.parametrize(
+        ("descriptor", "rule"),
+        [
+            (None, UsageRule.FINAL_ONLY),
+            ({"engine": {"name": "vllm"}, "router": None}, UsageRule.FINAL_ONLY),
+            (
+                {"engine": {"name": "vllm"}, "router": {"name": "smg", "transport": "http"}},
+                UsageRule.PER_CHOICE,
+            ),
+            (
+                {
+                    "engine": {"name": "sglang"},
+                    "router": {"name": "dynamo", "processor": "dynamo"},
+                },
+                UsageRule.REQUEST_WIDE,
+            ),
+        ],
+    )
+    async def test_registered_stack_survives_restore(
+        self, tmp_path, system_mocks, descriptor, rule
+    ):
+        state_file = tmp_path / "state-v2.json"
+        repo = GatewayProxyRepo(file=state_file)
+        client = GatewayClient(port=1)
+        await client._client.aclose()
+        run_id = uuid.uuid4()
+        stack = InferenceStack.model_validate(descriptor) if descriptor is not None else None
+        async with make_client(tmp_path, repo) as http:
+            with (
+                patch.object(client, "_client", http),
+                patch.object(http, "post", wraps=http.post) as post,
+            ):
+                await client.register_service(
+                    project="test-proj",
+                    run_id=run_id,
+                    run_name="test-run",
+                    domain="test-run.gtw.test",
+                    service_https=False,
+                    gateway_https=False,
+                    auth=True,
+                    client_max_body_size=1024,
+                    read_timeout=900,
+                    options=sample_model_options(),
+                    rate_limits=[],
+                    ssh_private_key="private-key",
+                    inference_stack=stack,
+                )
+                assert post.await_args is not None
+                payload = post.await_args.kwargs["json"]
+                if descriptor is None:
+                    assert "inference_stack" not in payload
+                else:
+                    assert payload["inference_stack"] == descriptor
+        restored = await GatewayProxyRepo.load(state_file).get_service("test-proj", "test-run")
+        assert restored is not None
+        assert restored.id == run_id.hex
+        assert restored.inference_stack == stack
+        assert restored.usage_rule is rule
+        assert "usage_rule" not in state_file.read_text()
+
     async def test_register(self, tmp_path: Path, system_mocks: Mocks) -> None:
         client = make_client(tmp_path)
         resp = await client.post(
@@ -605,13 +674,13 @@ class TestSetServiceId:
     async def test_set_id(self, tmp_path: Path, system_mocks: Mocks) -> None:
         repo = GatewayProxyRepo()
         client = make_client(tmp_path, repo=repo)
-        # simulate a service registered before IDs were introduced
+        # Register a service as a pre-0.21 server did, publishing its original route key.
         await repo.set_project(make_project("test-proj"))
-        await repo.set_service(
-            make_service("test-proj", "test-run", domain="test-run.gtw.test").model_copy(
-                update={"id": None}
-            )
-        )
+        payload = register_service_payload()
+        del payload["id"]
+        response = await client.post("/api/registry/test-proj/services/register", json=payload)
+        assert response.status_code == 200
+        published = (tmp_path / "sites-enabled" / "443-test-run.gtw.test.conf").read_text()
         new_id = uuid.uuid4().hex
         resp = await client.post(
             "/api/registry/test-proj/services/test-run/set_id",
@@ -622,6 +691,7 @@ class TestSetServiceId:
         service = await repo.get_service("test-proj", "test-run")
         assert service is not None
         assert service.id == new_id
+        assert service.nginx_route_key in published
 
     async def test_set_id_no_service_error(self, tmp_path: Path, system_mocks: Mocks) -> None:
         client = make_client(tmp_path)

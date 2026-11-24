@@ -2,13 +2,14 @@
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
+from dstack._internal.proxy.gateway.models import GatewayService
 from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
 from dstack._internal.proxy.lib.cancellation import await_completion
-from dstack._internal.proxy.lib.errors import ProxyError
+from dstack._internal.proxy.lib.errors import ProxyError, UnexpectedProxyError
+from dstack._internal.proxy.lib.models import Service
 from dstack._internal.proxy.lib.schemas.usage import (
     TokenUsage,
     UsageAckResponse,
@@ -20,9 +21,9 @@ from dstack._internal.proxy.lib.schemas.usage import (
     UsageKey,
 )
 from dstack._internal.proxy.lib.services.usage import (
-    METERING_PROFILES,
     UsageAttempt,
     UsageObserver,
+    UsageRule,
     normalize_usage,
 )
 from dstack._internal.utils.logging import get_logger
@@ -40,13 +41,11 @@ class MeteringCollector(UsageObserver):
         self,
         store: MeteringStore,
         clock: Clock | None = None,
-        profiles: Mapping[str, str] | None = None,
         max_pending: int = 1440,
         max_entries: int = 10000,
     ):
         self.store = store
         self.clock = clock or Clock()
-        self.profiles = dict(profiles or {})
         self.max_pending = max_pending
         self.max_entries = max_entries
         self._lock = asyncio.Lock()
@@ -59,19 +58,22 @@ class MeteringCollector(UsageObserver):
         self._last_time: datetime | None = None
         self._closed = False
         self._pending_bytes = 0
-        self._reconfiguring = False
         self._interrupted_drain = False
         self._saved_drain_state: str | None = None
 
     async def start(self) -> None:
         async with self._lock:
-            if self._state is not None:
+            if self._state is not None and self._storage_error is None:
                 return
-            if not self.profiles and not self.store.exists():
-                return
+            # A cancelled registration must finish opening and checkpointing the store
+            # before another registration can use the same collector.
+            await await_completion(asyncio.create_task(self._initialize()))
+
+    async def _initialize(self) -> None:
+        if self._state is None:
             await self._load()
-            await self._rotate(self.clock.utc_now())
-            await self._save(self._snapshot())
+        await self._rotate(self.clock.utc_now())
+        await self._save(self._snapshot())
 
     async def _load(self) -> None:
         saved = await asyncio.to_thread(self.store.load)
@@ -88,47 +90,19 @@ class MeteringCollector(UsageObserver):
             # start() checkpoints this before admitting traffic from the old Nginx generation.
             self._state = self._state.model_copy(update={"drain_state": "ingress"})
 
-    async def configure_profiles(
-        self, profiles: Mapping[str, str], persist: Callable[[], Awaitable[None]] | None = None
-    ) -> None:
-        async with self._lock:
-            self._reconfiguring = True
-            try:
-                if any(profile not in METERING_PROFILES for profile in profiles.values()):
-                    raise ProxyError("Unsupported metering profile")
-                changed = {
-                    key
-                    for key in self.profiles.keys() | profiles.keys()
-                    if self.profiles.get(key) != profiles.get(key)
-                }
-                if any(attempt.key.service_id in changed for attempt in self._attempts):
-                    raise ProxyError("Drain in-flight requests before changing metering", 409)
-                if self._state is not None:
-                    if await self._rotate(self.clock.utc_now()):
-                        await self._save(self._snapshot())
-                    if any(key.service_id in changed for key in self._entries):
-                        raise ProxyError("Change metering at a drained minute boundary", 409)
-                if persist is not None:
-                    await persist()
-                self.profiles = dict(profiles)
-            finally:
-                self._reconfiguring = False
-        await self.start()
+    def start_service_attempt(self, service: Service, key: UsageKey) -> UsageAttempt:
+        if not isinstance(service, GatewayService):
+            raise UnexpectedProxyError("Expected a registered Gateway service for metering")
+        return self.start_attempt(key, service.usage_rule)
 
-    def profile_for(self, service_id: str | None) -> str | None:
-        return self.profiles.get(service_id) if service_id is not None else None
-
-    def start_attempt(self, key: UsageKey, profile: str) -> UsageAttempt:
+    def start_attempt(self, key: UsageKey, rule: UsageRule) -> UsageAttempt:
         if (
             self._closed
-            or self._reconfiguring
             or self._state is None
             or self._interrupted_drain
             or self._state.drain_state in ("waiting", "sealed")
             or self._storage_error
             or self._clock_error
-            or self.profile_for(key.service_id) != profile
-            or profile not in METERING_PROFILES
         ):
             raise ProxyError("Usage metering is unavailable", 503)
         keys = set(self._entries) | {attempt.key for attempt in self._attempts} | {key}
@@ -142,7 +116,7 @@ class MeteringCollector(UsageObserver):
             or estimated_bytes > self.store.max_bytes
         ):
             raise ProxyError("Usage storage is full; collection is required", 503)
-        attempt = MeteringAttempt(self, key, profile)
+        attempt = MeteringAttempt(self, key, rule)
         self._attempts.add(attempt)
         return attempt
 
@@ -353,10 +327,10 @@ class MeteringCollector(UsageObserver):
 
 
 class MeteringAttempt(UsageAttempt):
-    def __init__(self, collector: MeteringCollector, key: UsageKey, profile: str):
+    def __init__(self, collector: MeteringCollector, key: UsageKey, rule: UsageRule):
         self.collector = collector
         self.key = key
-        self.profile = profile
+        self.rule = rule
         self.dispatched = False
         self.upstream_done = False
         self.finished = False
@@ -365,7 +339,7 @@ class MeteringAttempt(UsageAttempt):
         self._finish_task: asyncio.Task[None] | None = None
 
     def observe_usage(self, usage: Any) -> None:
-        confirmed = normalize_usage(usage, self.profile)
+        confirmed = normalize_usage(usage)
         if confirmed is not None:
             self.usage = confirmed
 

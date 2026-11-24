@@ -1,14 +1,19 @@
 from abc import ABC, abstractmethod
 from typing import Annotated, AsyncGenerator, Optional
 
+import httpx
 from fastapi import Depends, FastAPI, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from dstack._internal.proxy.lib.auth import BaseProxyAuthProvider
 from dstack._internal.proxy.lib.errors import ProxyError, UnexpectedProxyError
+from dstack._internal.proxy.lib.models import Service
 from dstack._internal.proxy.lib.repo import BaseProxyRepo
 from dstack._internal.proxy.lib.schemas.usage import AuthorizedSubject
-from dstack._internal.proxy.lib.services.service_connection import ServiceConnectionPool
+from dstack._internal.proxy.lib.services.service_connection import (
+    ServiceConnectionPool,
+    get_service_replica_client,
+)
 from dstack._internal.proxy.lib.services.usage import UsageObserver
 
 
@@ -34,11 +39,16 @@ class ProxyDependencyInjector(ABC):
     def get_auth_provider(self) -> AsyncGenerator[BaseProxyAuthProvider, None]:
         pass
 
-    def get_usage_observer(self) -> UsageObserver:
-        return UsageObserver()
+    def get_usage_observer(self) -> UsageObserver | None:
+        return None
 
     async def get_service_connection_pool(self) -> ServiceConnectionPool:
         return self._service_conn_pool
+
+    async def get_service_replica_client(
+        self, service: Service, repo: BaseProxyRepo
+    ) -> httpx.AsyncClient:
+        return await get_service_replica_client(service, repo, self._service_conn_pool)
 
 
 def get_injector_from_app(app: FastAPI) -> ProxyDependencyInjector:

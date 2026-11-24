@@ -20,6 +20,7 @@ from dstack._internal.proxy.gateway.services.nginx import (
     ReplicaConfig,
     ServiceConfig,
 )
+from tests._internal.proxy.gateway.common import make_service
 from tests._internal.proxy.gateway.metering.harness import Harness
 
 
@@ -29,6 +30,7 @@ def configs(root, backend_socket):
     )
     service = ServiceConfig(
         domain="service.test",
+        route_key=make_service("p", "run-a", run_id="a" * 32).nginx_route_key,
         project_name="p",
         https=False,
         auth=True,
@@ -158,6 +160,25 @@ http {{
             )
             await h.advance_clock()
             assert (await h.batches()) == page
+            # Simulate an in-flight request that selected run B before Nginx started
+            # serving run A on this hostname. It must never reach A's backend.
+            stale = await client.post(
+                "/chat/completions",
+                json={**body, "model": "model-b", "user": "retired"},
+                headers={
+                    "Host": "model.test",
+                    "Authorization": "Bearer token-a",
+                    "X-Test-Request-ID": "retired",
+                },
+            )
+            assert stale.status_code == 503
+            assert "retired" not in (await h.backend_control())["started"]
+            await h.wait_finalized("retired")
+            await h.advance_clock()
+            page = await h.batches()
+            [rejected] = page["batches"][-1]["entries"]
+            assert rejected["service_id"] == "b" * 32
+            assert rejected["unknown_usage_attempts"] == 1 and rejected["total_tokens"] == 0
             variants = [
                 "/api/usage/batches",
                 "/api/usage/batches/ack",

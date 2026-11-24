@@ -429,6 +429,59 @@ class TestRunSpecHasReplicaIpRefs:
 
 class TestCheckCanUpdateRunSpecRouter:
     @pytest.mark.parametrize(
+        ("old", "new", "can_update"),
+        [
+            ("vllm serve model", "python3 -m sglang.launch_server --model-path model", False),
+            ("vllm serve model", "python3 -m vllm.entrypoints.grpc_server --model model", False),
+            ("vllm serve model", "python serve.py", False),
+            ("python serve.py", "vllm serve model", False),
+            ("vllm serve model --port 8000", "vllm serve model --port 8001", True),
+            ("python serve.py", "python custom.py", True),
+        ],
+    )
+    def test_model_update_uses_inferred_worker_facts(self, old, new, can_update):
+        def spec_with_worker(command):
+            return _run_spec(
+                ServiceConfiguration.model_validate(
+                    {
+                        "port": 8000,
+                        "model": "chat",
+                        "groups": [
+                            {
+                                "replicas": 1,
+                                "router": {"type": "smg"},
+                                "commands": ["smg launch"],
+                            },
+                            {"replicas": 1, "commands": [command]},
+                        ],
+                    }
+                )
+            )
+
+        current = spec_with_worker(old)
+        updated = spec_with_worker(new)
+        if can_update:
+            check_can_update_run_spec(current, updated)
+        else:
+            with pytest.raises(ServerClientError, match="replacement run"):
+                check_can_update_run_spec(current, updated)
+
+    @pytest.mark.parametrize("model_format", ["openai", "tgi"])
+    def test_router_type_change_replaces_metered_model(self, model_format):
+        current_config = _service_configuration(router_type="smg").model_dump()
+        new_config = _service_configuration(router_type="dynamo").model_dump()
+        model = {"name": "m", "format": model_format}
+        current = _run_spec(
+            ServiceConfiguration.model_validate({**current_config, "model": model})
+        )
+        new = _run_spec(ServiceConfiguration.model_validate({**new_config, "model": model}))
+        if model_format == "openai":
+            with pytest.raises(ServerClientError, match="replacement run"):
+                check_can_update_run_spec(current, new)
+        else:
+            check_can_update_run_spec(current, new)
+
+    @pytest.mark.parametrize(
         ("current_router_type", "new_router_type"),
         [
             pytest.param("smg", "dynamo", id="smg-to-dynamo"),

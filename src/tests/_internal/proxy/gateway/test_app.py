@@ -5,9 +5,11 @@ import pytest
 from dstack._internal.proxy.gateway.app import lifespan, make_app
 from dstack._internal.proxy.gateway.models import ModelEntrypoint
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
+from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
 from dstack._internal.proxy.gateway.services.nginx import Nginx
 from dstack._internal.proxy.gateway.testing.common import Mocks
-from dstack._internal.proxy.lib.testing.common import make_project, make_service
+from dstack._internal.proxy.lib.testing.common import make_project
+from tests._internal.proxy.gateway.common import make_service
 
 
 @pytest.mark.asyncio
@@ -23,7 +25,11 @@ async def test_lifespan(tmp_path: Path, system_mocks: Mocks) -> None:
     nginx_dir = tmp_path / "nginx"
     conf_dir = nginx_dir / "sites-enabled"
     conf_dir.mkdir(parents=True)
-    app = make_app(repo=repo, nginx=Nginx(nginx_dir=nginx_dir))
+    app = make_app(
+        repo=repo,
+        nginx=Nginx(nginx_dir=nginx_dir),
+        metering_store=MeteringStore(tmp_path / "usage.json"),
+    )
     async with lifespan(app):
         assert (conf_dir / "00-log-format.conf").exists()
         assert (conf_dir / "443-gateway.gtw.test.conf").exists()

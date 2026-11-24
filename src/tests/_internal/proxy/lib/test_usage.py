@@ -12,8 +12,6 @@ from dstack._internal.proxy.lib.schemas.model_proxy import (
 from dstack._internal.proxy.lib.schemas.usage import UsageBatch, UsageCheckpoint, UsageEntry
 from dstack._internal.proxy.lib.services.usage import normalize_usage
 
-PROFILE = "vllm-0.19.1-prompt-details"
-
 
 class TestUsagePreservation:
     def test_usage_round_trip(self):
@@ -47,16 +45,18 @@ class TestUsagePreservation:
 
 
 class TestUsageNormalization:
-    @pytest.mark.parametrize("details", [None, {"cached_tokens": 5}])
-    def test_cache_normalization_is_profile_specific(self, details):
+    @pytest.mark.parametrize(
+        "details,cached",
+        [(None, 0), ({}, 0), ({"cached_tokens": None}, 0), ({"cached_tokens": 5}, 5)],
+    )
+    def test_unavailable_cache_details_preserve_final_counts(self, details, cached):
         raw = dict(
             prompt_tokens=20, completion_tokens=3, total_tokens=23, prompt_tokens_details=details
         )
-        usage = normalize_usage(raw, PROFILE)
+        usage = normalize_usage(raw)
         assert usage is not None
-        assert usage.cached_prompt_tokens == (0 if details is None else 5)
+        assert usage.cached_prompt_tokens == cached
         assert usage.prompt_tokens == 20
-        assert normalize_usage(raw, "unverified") is None
 
     @pytest.mark.parametrize(
         "patch",
@@ -67,13 +67,16 @@ class TestUsageNormalization:
             {"prompt_tokens": 20.0},
             {"prompt_tokens": "20"},
             {"prompt_tokens_details": {"cached_tokens": 21}},
-            {"prompt_tokens_details": {"cached_tokens": None}},
+            {"prompt_tokens_details": {"cached_tokens": -1}},
+            {"prompt_tokens_details": {"cached_tokens": False}},
+            {"prompt_tokens_details": {"cached_tokens": "5"}},
+            {"prompt_tokens_details": []},
         ],
     )
     def test_invalid_usage_is_unknown(self, patch):
         raw = dict(prompt_tokens=20, completion_tokens=3, total_tokens=23)
-        assert normalize_usage(raw | patch, PROFILE) is None
-        assert normalize_usage(None, PROFILE) is None
+        assert normalize_usage(raw | patch) is None
+        assert normalize_usage(None) is None
 
 
 class TestUsageContracts:

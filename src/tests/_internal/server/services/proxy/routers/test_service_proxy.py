@@ -14,9 +14,9 @@ from dstack._internal.proxy.lib.testing.auth import ProxyTestAuthProvider
 from dstack._internal.proxy.lib.testing.common import (
     ProxyTestDependencyInjector,
     make_project,
-    make_service,
 )
 from dstack._internal.server.services.proxy.routers.service_proxy import router
+from tests._internal.proxy.gateway.common import make_service
 
 MOCK_REPLICA_CLIENT_TIMEOUT = 8
 # Kept well below `MOCK_REPLICA_CLIENT_TIMEOUT` so the gateway timeout test does not wait 8s.

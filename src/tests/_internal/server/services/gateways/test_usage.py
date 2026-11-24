@@ -1,11 +1,12 @@
 import asyncio
+import json
 import logging
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from functools import partial
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -13,30 +14,51 @@ import pytest_asyncio
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import OperationalError
 
+from dstack._internal.core.models.configurations import ServiceConfiguration
+from dstack._internal.core.models.runs import ServiceSpec
+from dstack._internal.proxy.gateway.app import make_app
+from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
+from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
+from dstack._internal.proxy.lib.deps import get_proxy_auth_provider
 from dstack._internal.proxy.lib.schemas.usage import (
+    AuthorizedSubject,
     UsageAckResponse,
-    UsageBatchPage,
+    UsageBatch,
     UsageDrainResponse,
 )
+from dstack._internal.server.background.pipeline_tasks.gateway_replicas import _register_service
 from dstack._internal.server.db import Database
 from dstack._internal.server.models import (
     BackendModel,
     BaseModel,
     GatewayModel,
     GatewayReplicaModel,
+    ProjectModel,
     UsageBatchModel,
 )
 from dstack._internal.server.services.gateways import usage
+from dstack._internal.server.services.gateways.client import (
+    AsyncClientWrapper,
+    GatewayClient,
+    ReceivedUsagePage,
+)
 from dstack._internal.server.services.gateways.connection import GatewayConnection
+from dstack._internal.server.services.services.options import get_service_options
 from dstack._internal.server.services.usage import ingest_usage_batch
 from dstack._internal.server.testing.common import (
     create_backend,
     create_gateway,
     create_gateway_replica,
     create_project,
+    create_repo,
+    create_run,
     create_user,
+    get_run_spec,
 )
 from dstack._internal.utils.common import get_current_datetime
+from tests._internal.proxy.gateway.routers.test_registry import register_replica_payload
+from tests._internal.proxy.gateway.services.test_metering import FakeClock
+from tests._internal.proxy.lib.services.test_openai_usage import sse_choice, token_counts
 from tests._internal.server.services.test_usage import OTHER_RUN_ID, entry
 from tests._internal.server.services.test_usage import batch as make_batch
 
@@ -54,11 +76,23 @@ class GatewayQueue:
 
     async def fetch_usage_batches(self, limit):
         self.fetches += 1
-        return UsageBatchPage(batches=self.items[:limit], has_more=len(self.items) > limit)
+        return ReceivedUsagePage(
+            batches=[self.payload(item) for item in self.items[:limit]],
+            has_more=len(self.items) > limit,
+        )
+
+    @staticmethod
+    def payload(item):
+        return item.model_dump(mode="json") if isinstance(item, UsageBatch) else item
 
     async def acknowledge_usage(self, ids):
         self.acks.append(ids)
-        self.items = [b for b in self.items if b.batch_id not in ids]
+        remaining = []
+        for item in self.items:
+            payload = self.payload(item)
+            if not isinstance(payload, dict) or payload.get("batch_id") not in ids:
+                remaining.append(item)
+        self.items = remaining
         return UsageAckResponse(acknowledged_batch_ids=ids)
 
     async def drain_usage(self):
@@ -293,14 +327,89 @@ class TestCollectGatewayUsage:
         rows = await session.scalars(select(UsageBatchModel.batch_id))
         assert sorted(rows) == ["batch-1", "later"]
 
-    async def test_empty_page_caught_up_but_empty_batch_unacknowledged(self, replica, batch):
+    async def test_postgres_rejects_unstorable_batch_id_and_keeps_other_minutes(
+        self, session, test_db, replica, batch, caplog
+    ):
+        if test_db.dialect_name != "postgresql":
+            pytest.skip("PostgreSQL text columns reject a NUL character")
+        bad = batch("bad\0id", offset=1)
+        queue = GatewayQueue(replica.ip_address, [bad, batch()])
+        assert await usage.drain_gateway_usage(
+            queue.connection, replica.id, replica.gateway_id, replica.lock_token
+        )
+        assert queue.acks == [[bad.batch_id, "batch-1"]]
+        assert (await session.scalars(select(UsageBatchModel.batch_id))).all() == ["batch-1"]
+        (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert json.loads(record.getMessage().split(". Batch: ", 1)[1]) == queue.payload(bad)
+
+    async def test_empty_page_and_logged_empty_batch_can_drain(self, replica, batch, caplog):
         queue = GatewayQueue(replica.ip_address, [])
         args = queue.connection, replica.id, replica.gateway_id, replica.lock_token
         assert await usage.drain_gateway_usage(*args)
         queue.items = [batch(entries=[])]
-        assert not await usage.drain_gateway_usage(*args)
+        assert await usage.drain_gateway_usage(*args)
         assert queue.fetches == 1
-        assert queue.acks == [] and queue.items == [batch(entries=[])]
+        assert queue.acks == [["batch-1"]] and queue.items == []
+        assert "Usage batch must contain at least one entry" in caplog.text
+
+    @pytest.mark.parametrize("draining", [False, True])
+    @pytest.mark.parametrize(
+        "defect", ["unknown field", "missing field", "wrong type", "bad UUID"]
+    )
+    async def test_isolates_bad_minute_and_logs_its_original_entries(
+        self, session, replica, usage_user, batch, caplog, draining, defect
+    ):
+        bad = batch(
+            "bad", offset=1, entries=[entry(usage_user.id), entry(usage_user.id, OTHER_RUN_ID)]
+        ).model_dump(mode="json")
+        bad_entry = bad["entries"][1]
+        if defect == "unknown field":
+            bad_entry["diagnostic"] = {"unrecognized": [None, "original text"]}
+        elif defect == "missing field":
+            del bad_entry["service_id"]
+        elif defect == "wrong type":
+            bad_entry["prompt_tokens"] = "17"
+        else:
+            bad_entry["service_id"] = "invalid uuid"
+        queue = GatewayQueue(replica.ip_address, [batch(), bad, batch("next", offset=2)])
+
+        if draining:
+            assert await usage.drain_gateway_usage(
+                queue.connection, replica.id, replica.gateway_id, replica.lock_token
+            )
+        else:
+            await usage.collect_gateway_usage(queue.connection, replica.id, replica.lock_token)
+
+        assert queue.acks == [["batch-1", "bad", "next"]] and queue.items == []
+        assert sorted(await session.scalars(select(UsageBatchModel.batch_id))) == [
+            "batch-1",
+            "next",
+        ]
+        (record,) = [record for record in caplog.records if record.levelno == logging.ERROR]
+        message, raw = record.getMessage().split(". Batch: ", 1)
+        assert str(replica.id) in message and str(replica.gateway_id) in message
+        assert json.loads(raw) == bad
+
+    async def test_only_unique_addressable_minutes_can_be_acknowledged(
+        self, session, replica, batch, caplog
+    ):
+        no_id = batch().model_dump(mode="json", exclude={"batch_id"})
+        wrong_id = {**no_id, "batch_id": 99}
+        duplicates = [batch("same", offset=1), batch("same", offset=2)]
+        unaddressable = [no_id, wrong_id, ["not a batch object"], *duplicates]
+        queue = GatewayQueue(replica.ip_address, [*unaddressable, batch("unique", offset=3)])
+        args = (queue.connection, replica.id, replica.gateway_id, replica.lock_token)
+
+        assert not await usage.drain_gateway_usage(*args)
+        assert queue.acks == [["unique"]]
+        assert queue.items == unaddressable
+        assert (await session.scalars(select(UsageBatchModel.batch_id))).all() == ["unique"]
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert [json.loads(msg.split(". Batch: ", 1)[1]) for msg in errors] == [
+            queue.payload(item) for item in unaddressable
+        ]
+        assert not await usage.drain_gateway_usage(*args)
+        assert queue.acks == [["unique"]]
 
     async def test_page_budget_leaves_remainder_for_next_poll(
         self, session, replica, batch, monkeypatch
@@ -511,3 +620,174 @@ class TestCollectGatewayUsageSQLiteLock:
             await contender.commit()
         assert await session.scalar(select(GatewayReplicaModel.lock_token)) == next_token
         assert (await session.scalars(select(UsageBatchModel.total_tokens))).all() == [23]
+
+
+@pytest_asyncio.fixture
+async def dynamo_run(session, replica, usage_user, missing_fact):
+    gateway_model = await session.get(GatewayModel, replica.gateway_id)
+    project = await session.get(ProjectModel, gateway_model.project_id)
+    repo = await create_repo(session, project.id)
+    frontend = "python3 -m dynamo.frontend"
+    if missing_fact != "processor":
+        frontend += " --dyn-chat-processor dynamo"
+    worker = (
+        "python serve.py" if missing_fact == "engine" else "python3 -m dynamo.sglang --model test"
+    )
+    config = ServiceConfiguration.model_validate(
+        {
+            "port": 8000,
+            "model": "test",
+            "groups": [
+                {
+                    "name": "frontend",
+                    "replicas": 1,
+                    "router": {"type": "dynamo"},
+                    "commands": [frontend],
+                },
+                {
+                    "name": "worker",
+                    "replicas": 1,
+                    "commands": [worker],
+                },
+            ],
+        }
+    )
+    run = await create_run(
+        session,
+        project,
+        repo,
+        usage_user,
+        gateway=gateway_model,
+        run_spec=get_run_spec(repo.name, configuration=config),
+    )
+    run.service_spec = ServiceSpec(
+        url="https://test.example.com", options=get_service_options(config)
+    ).model_dump_json()
+    await session.commit()
+    await session.refresh(run, ["project", "gateway"])
+    return run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+@pytest.mark.parametrize(
+    "mode,missing_fact",
+    [
+        ("json", None),
+        ("stream", None),
+        ("interrupted", None),
+        ("stream", "processor"),
+        ("interrupted", "processor"),
+        ("stream", "engine"),
+        ("interrupted", "engine"),
+    ],
+)
+async def test_first_registered_chat_reaches_sql_once(
+    test_db, session, replica, usage_user, dynamo_run, tmp_path, monkeypatch, mode, missing_fact
+):
+    clock = FakeClock()
+    clock.advance(58)
+    first_minute = clock.now.replace(second=0)
+    app = make_app(
+        repo=GatewayProxyRepo(),
+        metering_store=MeteringStore(tmp_path / "usage.json"),
+        clock=clock,
+    )
+    collector = app.state.proxy_dependency_injector.get_metering()
+    monkeypatch.setattr(
+        "dstack._internal.proxy.gateway.services.registry.apply_service",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        "dstack._internal.proxy.gateway.services.registry.apply_entrypoint", AsyncMock()
+    )
+    auth = AsyncMock()
+    auth.is_project_member.return_value = True
+    auth.resolve_subject.return_value = AuthorizedSubject(consumer_subject_id=usage_user.id.hex)
+    app.dependency_overrides[get_proxy_auth_provider] = lambda: auth
+
+    class TwoMinuteStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            partial = sse_choice(0, content="first", usage=token_counts(0, 55))
+            yield ("data: " + json.dumps(partial) + "\n\n").encode()
+            clock.advance(5)
+            await collector.rotate_if_due()
+            assert (await collector.get_batches()).batches == []
+            if mode == "stream":
+                final = {**sse_choice(0), "choices": [], "usage": token_counts(0, 100)}
+                yield ("data: " + json.dumps(final) + "\n\ndata: [DONE]\n\n").encode()
+
+    def infer(request):
+        if mode == "json":
+            return httpx.Response(
+                200, json={**sse_choice(0), "choices": [], "usage": token_counts(0, 100)}
+            )
+        expected = {"include_usage": True}
+        if missing_fact is None:
+            expected["continuous_usage_stats"] = True
+        assert json.loads(request.content)["stream_options"] == expected
+        return httpx.Response(200, stream=TwoMinuteStream())
+
+    backend_handler = Mock(side_effect=infer)
+    gateway = GatewayClient(port=1)
+    await gateway._client.aclose()
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(backend_handler), base_url="http://model"
+        ) as backend,
+        AsyncClientWrapper(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as http,
+    ):
+        gateway._client = http
+        monkeypatch.setattr(
+            app.state.proxy_dependency_injector,
+            "get_service_replica_client",
+            AsyncMock(return_value=backend),
+        )
+        await _register_service(gateway, dynamo_run.gateway, replica, dynamo_run)
+        project_name = dynamo_run.project.name
+        (
+            await http.post(
+                f"/api/registry/{project_name}/services/{dynamo_run.run_name}/replicas/register",
+                json=register_replica_payload(),
+            )
+        ).raise_for_status()
+        reply = await http.post(
+            f"/api/models/{project_name}/chat/completions",
+            headers={"Authorization": "Bearer token"},
+            json={"model": "test", "messages": [], "stream": mode != "json"},
+        )
+        reply.raise_for_status()
+        backend_handler.assert_called_once()
+        clock.advance()
+        await collector.rotate_if_due()
+        (closed_batch,) = (await collector.get_batches()).batches
+
+        @asynccontextmanager
+        async def connected_client():
+            yield gateway
+
+        connection = Mock(
+            spec=GatewayConnection, ip_address=replica.ip_address, client=connected_client
+        )
+        ack = gateway.acknowledge_usage
+        lost_ack = AsyncMock(side_effect=httpx.WriteError("lost ACK"))
+        monkeypatch.setattr(gateway, "acknowledge_usage", lost_ack)
+        await usage.collect_gateway_usage(connection, replica.id, replica.lock_token)
+        lost_ack.assert_awaited_once_with([closed_batch.batch_id])
+        assert (await collector.get_batches()).batches == [closed_batch]
+        monkeypatch.setattr(gateway, "acknowledge_usage", ack)
+        await usage.collect_gateway_usage(connection, replica.id, replica.lock_token)
+        assert (await collector.get_batches()).batches == []
+        (row,) = (await session.scalars(select(UsageBatchModel))).all()
+        assert row.user_id == usage_user.id and row.run_id == dynamo_run.id
+        assert row.batch_id == closed_batch.batch_id
+        expected_minute = first_minute + timedelta(minutes=int(mode != "json"))
+        assert row.interval_start == expected_minute
+        expected_tokens = 100
+        if mode == "interrupted":
+            expected_tokens = 55 if missing_fact is None else 0
+        assert row.completion_tokens == row.total_tokens == expected_tokens
+        assert row.unknown_usage_attempts == int(mode == "interrupted")
+    await collector.close()
