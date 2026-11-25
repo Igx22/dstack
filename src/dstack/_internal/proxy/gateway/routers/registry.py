@@ -32,7 +32,7 @@ async def register_service(
     service_conn_pool: Annotated[ServiceConnectionPool, Depends(get_service_connection_pool)],
 ) -> OkResponse:
     model = body.options.openai.model if body.options.openai is not None else None
-    if model is not None and model.format == "openai":
+    if model is not None:
         await metering.start()
     await registry_services.register_service(
         project_name=project_name.lower(),

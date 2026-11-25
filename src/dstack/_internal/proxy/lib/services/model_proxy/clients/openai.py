@@ -40,6 +40,8 @@ class OpenAIChatCompletions(ChatCompletionsClient):
             if not isinstance(data, dict):
                 raise ValueError("Expected a response object")
             response = validate_json_extra_ignore(ChatCompletionsResponse, raw)
+            if response.usage is None:
+                raise ValueError("Expected usage in OpenAI chat completion")
             if attempt is not None:
                 attempt.observe_usage(data.get("usage"))
                 attempt.mark_upstream_done()

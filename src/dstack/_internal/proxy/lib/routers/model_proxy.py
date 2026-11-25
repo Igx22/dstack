@@ -63,9 +63,9 @@ async def post_chat_completions(
         )
     observer = injector.get_usage_observer()
     attempt = None
-    if observer is not None and model.format_spec.format == "openai":
+    if observer is not None:
         if service.id is None:
-            raise ProxyError("Metering requires a registered OpenAI service", 503)
+            raise ProxyError("Metering requires a registered model service", 503)
         subject = await auth.require_subject()
         attempt = observer.start_service_attempt(
             service,
@@ -81,7 +81,7 @@ async def post_chat_completions(
             return await client.generate(body, attempt=attempt)
         source = client.stream(body) if attempt is None else client.stream(body, attempt=attempt)
         include_usage = (
-            attempt is not None
+            (attempt is not None or model.format_spec.format == "tgi")
             and body.stream_options is not None
             and body.stream_options.include_usage
         )

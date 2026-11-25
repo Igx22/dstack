@@ -63,7 +63,7 @@ class ChatCompletionsResponse(CoreModel):
     model: str
     system_fingerprint: Optional[str] = ""
     object: Literal["chat.completion"] = "chat.completion"
-    usage: ChatCompletionsUsage
+    usage: ChatCompletionsUsage | None
 
 
 class ChatCompletionsChunk(CoreModel):

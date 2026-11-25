@@ -83,13 +83,9 @@ class GatewayProxyRepo(BaseProxyRepo):
         async with self.reader():
             return list(self._state.models.get(project_name, {}).values())
 
-    async def has_openai_models(self) -> bool:
+    async def has_models(self) -> bool:
         async with self.reader():
-            return any(
-                model.format_spec.format == "openai"
-                for project_models in self._state.models.values()
-                for model in project_models.values()
-            )
+            return any(self._state.models.values())
 
     async def get_model(self, project_name: str, name: str) -> Optional[ChatModel]:
         async with self.reader():

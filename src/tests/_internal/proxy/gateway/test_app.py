@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.services.metering_store import MeteringStore
 from dstack._internal.proxy.gateway.services.nginx import Nginx
 from dstack._internal.proxy.gateway.testing.common import Mocks
+from dstack._internal.proxy.lib.models import ChatModel, TGIChatModelFormat
 from dstack._internal.proxy.lib.testing.common import make_project
 from tests._internal.proxy.gateway.common import make_service
 
@@ -38,3 +40,26 @@ async def test_lifespan(tmp_path: Path, system_mocks: Mocks) -> None:
         assert system_mocks.open_conn.call_count == 1
         assert system_mocks.close_conn.call_count == 0
     assert system_mocks.close_conn.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_restored_tgi_route_initializes_metering(tmp_path, system_mocks):
+    state = tmp_path / "state-v2.json"
+    repo = GatewayProxyRepo.load(state)
+    await repo.set_model(
+        ChatModel(
+            project_name="p",
+            name="test",
+            run_name="run",
+            created_at=datetime.now(timezone.utc),
+            format_spec=TGIChatModelFormat(chat_template="prompt", eos_token="</s>"),
+        )
+    )
+    store = MeteringStore(tmp_path / "usage.json")
+    (tmp_path / "sites-enabled").mkdir()
+    app = make_app(
+        repo=GatewayProxyRepo.load(state), nginx=Nginx(nginx_dir=tmp_path), metering_store=store
+    )
+    assert not store.exists()
+    async with lifespan(app):
+        assert store.exists()

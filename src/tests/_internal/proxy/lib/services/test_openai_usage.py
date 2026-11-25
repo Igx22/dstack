@@ -113,6 +113,7 @@ async def test_backend_usage_is_observed_and_forwarded(tmp_path, stream, include
             assert transport_stream.closed
         else:
             result = await client.generate(request, attempt=attempt)
+            assert result.usage is not None
             assert result.usage.prompt_tokens_details is not None
             assert result.usage.prompt_tokens_details.cached_tokens == 5
     await attempt.finish()
@@ -128,6 +129,22 @@ async def test_backend_usage_is_observed_and_forwarded(tmp_path, stream, include
     ) == (20, 5, 3, 23)
     assert entry.unknown_usage_attempts == 0
     await c.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_json_requires_usage():
+    def backend(request):
+        return httpx.Response(
+            200, json={"id": "answer", "created": 1, "model": "m", "choices": [], "usage": None}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(backend), base_url="http://backend"
+    ) as http:
+        adapter = OpenAIChatCompletions(http, "/v1")
+        with pytest.raises(ProxyError) as exc:
+            await adapter.generate(ChatCompletionsRequest(model="m", messages=[]))
+    assert exc.value.status_code == 502
 
 
 @pytest.mark.asyncio

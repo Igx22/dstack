@@ -1,7 +1,7 @@
 import datetime
 import json
 import uuid
-from typing import AsyncIterator, Dict, List
+from typing import AsyncIterator, Dict, List, TypeGuard
 
 import httpx
 import jinja2
@@ -18,6 +18,7 @@ from dstack._internal.proxy.lib.schemas.model_proxy import (
     ChatCompletionsUsage,
     ChatMessage,
 )
+from dstack._internal.proxy.lib.schemas.usage import TokenUsage
 from dstack._internal.proxy.lib.services.model_proxy.clients.base import ChatCompletionsClient
 from dstack._internal.proxy.lib.services.usage import UsageAttempt
 
@@ -42,6 +43,8 @@ class TGIChatCompletions(ChatCompletionsClient):
     ) -> ChatCompletionsResponse:
         payload = self.get_payload(request)
         try:
+            if attempt is not None:
+                attempt.mark_dispatched()
             resp = await self.client.post("/generate", json=payload)
             await self.propagate_error(resp)
         except httpx.RequestError as e:
@@ -61,8 +64,8 @@ class TGIChatCompletions(ChatCompletionsClient):
                 ),
             )
         ]
-        completion_tokens = data["details"]["generated_tokens"]
-        prompt_tokens = len(data["details"]["prefill"])
+        generated_counts = [data["details"].get("generated_tokens")]
+        prefill = data["details"].get("prefill")
 
         for i, sequence in enumerate(data["details"].get("best_of_sequences", []), start=1):
             choices.append(
@@ -77,7 +80,7 @@ class TGIChatCompletions(ChatCompletionsClient):
                     ),
                 )
             )
-            completion_tokens += sequence["generated_tokens"]
+            generated_counts.append(sequence.get("generated_tokens"))
 
         return ChatCompletionsResponse(
             id=uuid.uuid4().hex,
@@ -85,10 +88,12 @@ class TGIChatCompletions(ChatCompletionsClient):
             created=int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
             model=request.model,
             system_fingerprint=f"fp_{data['details']['seed']}",
-            usage=ChatCompletionsUsage(
-                completion_tokens=completion_tokens,
-                prompt_tokens=prompt_tokens,  # TODO(egor-s): do we need to multiply by number of sequences?
-                total_tokens=completion_tokens + prompt_tokens,
+            usage=_final_usage(
+                attempt,
+                len(prefill) if isinstance(prefill, list) else None,
+                sum(generated_counts)
+                if all(_is_token_count(n) for n in generated_counts)
+                else None,
             ),
         )
 
@@ -100,16 +105,30 @@ class TGIChatCompletions(ChatCompletionsClient):
 
         payload = self.get_payload(request)
         try:
+            if attempt is not None:
+                attempt.mark_dispatched()
             async with self.client.stream("POST", "/generate_stream", json=payload) as resp:
                 await self.propagate_error(resp)
                 async for line in resp.aiter_lines():
-                    if line.startswith("data:"):
-                        yield self.parse_chunk(
-                            data=json.loads(line[len("data:") :].strip("\n")),
-                            model=request.model,
-                            completion_id=completion_id,
-                            created=created,
-                        )
+                    if not line.startswith("data:"):
+                        continue
+                    data = json.loads(line[len("data:") :])
+                    chunk = self.parse_chunk(data, request.model, completion_id, created)
+                    details = data["details"]
+                    if details is None:
+                        yield chunk
+                        continue
+                    usage = _final_usage(
+                        attempt, details.get("input_length"), details.get("generated_tokens")
+                    )
+                    yield chunk
+                    if (
+                        request.stream_options
+                        and request.stream_options.include_usage
+                        and usage is not None
+                    ):
+                        yield chunk.model_copy(update={"choices": [], "usage": usage})
+                    return
         except httpx.RequestError as e:
             raise ProxyError(f"Error requesting model: {e!r}", status.HTTP_502_BAD_GATEWAY)
 
@@ -118,32 +137,30 @@ class TGIChatCompletions(ChatCompletionsClient):
     ) -> ChatCompletionsChunk:
         if "error" in data:
             raise ProxyError(data["error"])
-        chunk = ChatCompletionsChunk(
+        details = data["details"]
+        if details is None:
+            reason = None
+            delta = {"content": data["token"]["text"], "role": "assistant"}
+        else:
+            reason = self.finish_reason(details["finish_reason"])
+            delta = {}
+            token = data.get("token")
+            if reason == "length" and isinstance(token, dict) and token.get("special") is False:
+                text = token.get("text")
+                if isinstance(text, str) and text:
+                    delta["content"] = text
+
+        return ChatCompletionsChunk(
             id=completion_id,
-            choices=[],
+            choices=[
+                ChatCompletionsChunkChoice(
+                    delta=delta, finish_reason=reason, index=0, logprobs=None
+                )
+            ],
             created=created,
             model=model,
             system_fingerprint="",
         )
-        if data["details"] is not None:
-            chunk.choices = [
-                ChatCompletionsChunkChoice(
-                    delta={},
-                    logprobs=None,
-                    finish_reason=self.finish_reason(data["details"]["finish_reason"]),
-                    index=0,
-                )
-            ]
-        else:
-            chunk.choices = [
-                ChatCompletionsChunkChoice(
-                    delta={"content": data["token"]["text"], "role": "assistant"},
-                    logprobs=None,
-                    finish_reason=None,
-                    index=0,
-                )
-            ]
-        return chunk
 
     def get_payload(self, request: ChatCompletionsRequest) -> Dict:
         try:
@@ -176,7 +193,7 @@ class TGIChatCompletions(ChatCompletionsClient):
             "details": True,  # to get best_of_sequences
             "decoder_input_details": not request.stream,
         }
-        if request.top_p < 1.0:
+        if request.top_p is not None and request.top_p < 1.0:
             parameters["top_p"] = request.top_p
         return {
             "inputs": inputs,
@@ -211,3 +228,29 @@ class TGIChatCompletions(ChatCompletionsClient):
 
 def raise_exception(message: str):
     raise jinja2.TemplateError(message)
+
+
+def _final_usage(
+    attempt: UsageAttempt | None, prompt: object, completion: object
+) -> ChatCompletionsUsage | None:
+    usage = None
+    if _is_token_count(completion):
+        if _is_token_count(prompt):
+            usage = ChatCompletionsUsage(
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                total_tokens=prompt + completion,
+            )
+            if attempt is not None:
+                attempt.observe_usage(usage)
+        elif attempt is not None:
+            attempt.observe_partial_usage(
+                TokenUsage(completion_tokens=completion, total_tokens=completion)
+            )
+    if attempt is not None:
+        attempt.mark_upstream_done()
+    return usage
+
+
+def _is_token_count(value: object) -> TypeGuard[int]:
+    return type(value) is int and value >= 0

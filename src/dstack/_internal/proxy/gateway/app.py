@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     await apply_all(repo, nginx, service_conn_pool)
 
     metering = injector.get_metering()
-    if metering.store.exists() or await repo.has_openai_models():
+    if metering.store.exists() or await repo.has_models():
         await metering.start()
     maintenance = asyncio.create_task(_metering_maintenance(metering))
     try:
